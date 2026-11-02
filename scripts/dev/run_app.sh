@@ -1,0 +1,257 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+# Build configuration: Debug by default. Set MACPARAKEET_CONFIG=Release for an
+# optimized build (e.g. to feel-test true STT latency — Debug Swift is ~10x
+# slower for the Cohere decoder's per-step work).
+CONFIG="${MACPARAKEET_CONFIG:-Debug}"
+case "$CONFIG" in
+  Debug|Release) ;;
+  *) echo "MACPARAKEET_CONFIG must be Debug or Release." >&2; exit 1 ;;
+esac
+# This repository is SwiftPM-native (there is no .xcodeproj/.xcworkspace).
+# Keep the wrapped development app separate from SwiftPM's build products so a
+# clean app bundle can be made without mutating the source checkout.
+DEV_APP_DIR="$ROOT_DIR/.build/dev-app/$CONFIG"
+PRODUCT_DIR=""
+APP_BIN=""
+APP_BUNDLE="$DEV_APP_DIR/MacParakeet-Dev.app"
+LOG_FILE="${TMPDIR:-/tmp}/macparakeet-dev.log"
+BUILD_LOG_FILE="${TMPDIR:-/tmp}/macparakeet-dev-build.log"
+APP_MACOS_BIN="$APP_BUNDLE/Contents/MacOS/MacParakeet"
+# Keep every Dev bundle off the stable app's database and media directories.
+# The override is honored in both Debug and optimized Release configurations.
+APP_STATE_DIR="${MACPARAKEET_DEBUG_APP_STATE_DIR:-$HOME/Library/Application Support/MacParakeet-Dev}"
+
+pick_codesign_identity() {
+  local preferred="${MACPARAKEET_CODESIGN_IDENTITY:-}"
+  if [[ -n "$preferred" ]]; then
+    printf '%s\n' "$preferred"
+    return
+  fi
+
+  local identities
+  identities="$(security find-identity -v -p codesigning 2>/dev/null || true)"
+
+  while IFS= read -r candidate; do
+    if grep -Fq "\"$candidate" <<<"$identities"; then
+      printf '%s\n' "$candidate"
+      return
+    fi
+  done < <(printf '%s\n' "Apple Development" "Mac Development")
+
+  local developer_id
+  developer_id="$(sed -n 's/.*"\(Developer ID Application:.*\)".*/\1/p' <<<"$identities" | head -n 1)"
+  if [[ -n "$developer_id" ]]; then
+    printf '%s\n' "$developer_id"
+    return
+  fi
+
+  # Ad-hoc signing keeps the bundle launchable even on machines without a
+  # development certificate. It is enough for local debugging, but TCC may be
+  # less sticky across rebuilds than a real signing identity.
+  printf '%s\n' "-"
+}
+
+CODESIGN_IDENTITY="$(pick_codesign_identity)"
+APP_ENTITLEMENTS="$ROOT_DIR/scripts/dist/MacParakeet.entitlements"
+
+sync_frameworks_into_bundle() {
+  local source_dir="$1"
+  local bundle_fw_dir="$2"
+
+  [[ -d "$source_dir" ]] || return 0
+
+  for fw in "$source_dir"/*.framework; do
+    [[ -e "$fw" ]] || continue
+    local fw_name
+    local resolved_fw
+    fw_name="$(basename "$fw")"
+    resolved_fw="$(realpath "$fw")"
+    rm -rf "$bundle_fw_dir/$fw_name"
+    rsync -a --delete "$resolved_fw/" "$bundle_fw_dir/$fw_name/"
+  done
+}
+
+binary_has_rpath() {
+  local binary="$1"
+  local wanted="$2"
+  local current
+
+  while IFS= read -r current; do
+    [[ "$current" == "$wanted" ]] && return 0
+  done < <(otool -l "$binary" | awk '
+    $1 == "cmd" && $2 == "LC_RPATH" { in_rpath=1; next }
+    in_rpath && $1 == "path" { print $2; in_rpath=0 }
+  ')
+
+  return 1
+}
+
+echo "[1/5] Requesting ordinary quit for this worktree's dev build…"
+source "$ROOT_DIR/scripts/dev/stop_app_processes.sh"
+stop_app_processes 10 "$ROOT_DIR" "$APP_MACOS_BIN"
+
+SWIFT_CONFIG="$(tr '[:upper:]' '[:lower:]' <<<"$CONFIG")"
+echo "[2/5] Building $CONFIG SwiftPM product (locked local dependencies)…"
+if ! swift build \
+  -c "$SWIFT_CONFIG" \
+  --product MacParakeet \
+  --disable-automatic-resolution \
+  --only-use-versions-from-resolved-file \
+  --skip-update >"$BUILD_LOG_FILE" 2>&1; then
+  echo "SwiftPM build failed. Last 120 log lines from $BUILD_LOG_FILE:" >&2
+  tail -n 120 "$BUILD_LOG_FILE" >&2 || true
+  exit 1
+fi
+
+PRODUCT_DIR="$(swift build \
+  -c "$SWIFT_CONFIG" \
+  --disable-automatic-resolution \
+  --only-use-versions-from-resolved-file \
+  --skip-update \
+  --show-bin-path)"
+APP_BIN="$PRODUCT_DIR/MacParakeet"
+
+if [[ ! -x "$APP_BIN" ]]; then
+  echo "Build succeeded but app binary not found at: $APP_BIN" >&2
+  exit 1
+fi
+
+echo "[3/5] Wrapping in .app bundle for macOS permissions…"
+# Create a minimal .app bundle so macOS TCC (Accessibility, Microphone) can
+# identify and remember permissions for the dev build across rebuilds.
+rm -rf "$APP_BUNDLE"
+MACOS_DIR="$APP_BUNDLE/Contents/MacOS"
+mkdir -p "$MACOS_DIR"
+cp -f "$APP_BIN" "$APP_MACOS_BIN"
+
+# Copy resource bundle (contains discover-fallback.json etc.)
+RESOURCE_BUNDLE="$PRODUCT_DIR/MacParakeet_MacParakeet.bundle"
+if [[ -d "$RESOURCE_BUNDLE" ]]; then
+  RESOURCES_DIR="$APP_BUNDLE/Contents/Resources"
+  mkdir -p "$RESOURCES_DIR"
+  rsync -a --delete "$RESOURCE_BUNDLE" "$RESOURCES_DIR/"
+fi
+
+# Dependency resource bundles must keep their bundle directory name because
+# Bundle.module resolves them under Contents/Resources at runtime. The
+# distribution builder already copies every SwiftPM bundle; mirror that here
+# for dependencies such as SwiftStreamingMarkdown and its syntax highlighter.
+RESOURCES_DIR="$APP_BUNDLE/Contents/Resources"
+mkdir -p "$RESOURCES_DIR"
+while IFS= read -r -d '' bundle; do
+  if [[ "$bundle" != "$RESOURCE_BUNDLE" ]]; then
+    bundle_name="${bundle##*/}"
+    rsync -a --delete "$bundle/" "$RESOURCES_DIR/$bundle_name/"
+  fi
+done < <(find "$PRODUCT_DIR" -maxdepth 1 -type d -name '*.bundle' -print0)
+mkdir -p "$RESOURCES_DIR/Legal"
+cp "$ROOT_DIR/Sources/MacParakeet/Resources/Legal/MarkdownDependencies.txt" "$RESOURCES_DIR/Legal/MarkdownDependencies.txt"
+cp "$ROOT_DIR/THIRD_PARTY_LICENSES.md" "$RESOURCES_DIR/Legal/THIRD_PARTY_LICENSES.md"
+
+# Copy frameworks into the bundle so dyld loads only bundle-local paths.
+BUNDLE_FW_DIR="$APP_BUNDLE/Contents/Frameworks"
+rm -rf "$BUNDLE_FW_DIR"
+mkdir -p "$BUNDLE_FW_DIR"
+sync_frameworks_into_bundle "$PRODUCT_DIR" "$BUNDLE_FW_DIR"
+
+# SwiftPM's executable records an absolute build-product rpath. Remove every
+# rpath rooted at its current product directory, then load the copied frameworks
+# exclusively from inside the signed app bundle.
+while IFS= read -r current_rpath; do
+  [[ "$current_rpath" == "$PRODUCT_DIR"* ]] || continue
+  install_name_tool -delete_rpath "$current_rpath" "$APP_MACOS_BIN"
+done < <(otool -l "$APP_MACOS_BIN" | sed -n 's/^[[:space:]]*path \(.*\) (offset [0-9][0-9]*)$/\1/p')
+if ! binary_has_rpath "$APP_MACOS_BIN" "@executable_path/../Frameworks"; then
+  install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP_MACOS_BIN"
+fi
+
+cat > "$APP_BUNDLE/Contents/Info.plist" << 'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.macparakeet.dev</string>
+    <key>CFBundleName</key>
+    <string>MacParakeet Dev</string>
+    <key>CFBundleExecutable</key>
+    <string>MacParakeet</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.0.0</string>
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsLocalNetworking</key>
+        <true/>
+        <!-- Keep in sync with scripts/dist/build_app_bundle.sh: ATS blocks
+             cleartext http to CGNAT 100.64.0.0/10 (Tailscale) even with
+             NSAllowsLocalNetworking, while the Settings validator allows it. -->
+        <key>NSExceptionDomains</key>
+        <dict>
+            <key>100.64.0.0/10</key>
+            <dict>
+                <key>NSExceptionAllowsInsecureHTTPLoads</key>
+                <true/>
+            </dict>
+        </dict>
+    </dict>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>MacParakeet needs microphone access for voice dictation.</string>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>MacParakeet needs system audio recording access for meeting recording.</string>
+    <key>NSCalendarsFullAccessUsageDescription</key>
+    <string>MacParakeet reads your calendar so it can remind you before a meeting starts and (optionally) begin recording for you. Events stay on your Mac.</string>
+</dict>
+</plist>
+PLIST
+
+# Re-sign the bundle so TCC can identify the dev build consistently. Use the
+# release app entitlements so permission smoke tests exercise the same TCC
+# capability surface as the signed distribution build. Ad-hoc signatures carry
+# no Team ID, so hardened-runtime library validation would reject the
+# bundle-local Sparkle.framework at load (dyld: "code signature … not valid
+# for use in process") — disable library validation for the ad-hoc fallback
+# only; real identities keep the release entitlement surface.
+SIGN_ENTITLEMENTS="$APP_ENTITLEMENTS"
+if [[ "$CODESIGN_IDENTITY" == "-" ]]; then
+  echo "  note: no codesigning identity found; ad-hoc signing with library validation disabled"
+  SIGN_ENTITLEMENTS="$(mktemp -t macparakeet-dev-entitlements)"
+  trap 'rm -f "$SIGN_ENTITLEMENTS"' EXIT
+  cp "$APP_ENTITLEMENTS" "$SIGN_ENTITLEMENTS"
+  # `Add` fails if the key ever lands in the release entitlements; fall back
+  # to `Set` so the merge stays idempotent.
+  /usr/libexec/PlistBuddy -c \
+    "Add :com.apple.security.cs.disable-library-validation bool true" \
+    "$SIGN_ENTITLEMENTS" 2>/dev/null || \
+    /usr/libexec/PlistBuddy -c \
+      "Set :com.apple.security.cs.disable-library-validation true" \
+      "$SIGN_ENTITLEMENTS"
+fi
+codesign --force --sign "$CODESIGN_IDENTITY" --options runtime \
+  --entitlements "$SIGN_ENTITLEMENTS" --deep "$APP_BUNDLE"
+
+GIT_COMMIT="$(git -C "$ROOT_DIR" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
+BUILD_DATE_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+BUILD_SOURCE="dev-run-swiftpm-$(echo "$CONFIG" | tr '[:upper:]' '[:lower:]')"
+
+echo "[4/5] Launching ${CONFIG} app…"
+open -n "$APP_BUNDLE" --env MACPARAKEET_DEBUG_APP_STATE_DIR="$APP_STATE_DIR" \
+  --env MACPARAKEET_GIT_COMMIT="$GIT_COMMIT" \
+  --env MACPARAKEET_BUILD_DATE_UTC="$BUILD_DATE_UTC" \
+  --env MACPARAKEET_BUILD_SOURCE="$BUILD_SOURCE" >"$LOG_FILE" 2>&1
+
+echo "[5/5] Launch requested"
+echo "  bundle: $APP_BUNDLE"
+echo "  source: $BUILD_SOURCE"
+echo "  commit: $GIT_COMMIT"
+echo "  built-at: $BUILD_DATE_UTC"
+echo "  state: $APP_STATE_DIR"
+echo "  codesign: $CODESIGN_IDENTITY"
+echo "  log: $LOG_FILE"
+echo "  build-log: $BUILD_LOG_FILE"

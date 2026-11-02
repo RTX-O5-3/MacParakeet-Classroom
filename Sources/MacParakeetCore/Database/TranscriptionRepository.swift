@@ -1,0 +1,814 @@
+import Foundation
+import GRDB
+
+public enum TranscriptionCompletionError: Error, Equatable, LocalizedError {
+    case recordingDeleted
+
+    public var errorDescription: String? {
+        "This recording was deleted before transcription completed."
+    }
+}
+
+public protocol TranscriptionRepositoryProtocol: Sendable {
+    func save(_ transcription: Transcription) throws
+    /// Persists a meeting transcription completed from a potentially stale
+    /// pre-STT snapshot while retaining classification changed during the
+    /// long-running transcription work.
+    func savePreservingMeetingClassification(_ transcription: Transcription) throws
+    /// Merge current user-owned metadata and return the row from the same write transaction.
+    func savePreservingUserMetadata(_ transcription: Transcription, originalFileName: String) throws -> Transcription
+    func fetch(id: UUID) throws -> Transcription?
+    func fetchAll(limit: Int?) throws -> [Transcription]
+    func fetchLibraryPage(query: TranscriptionLibraryQuery) throws -> TranscriptionLibraryPage
+    func fetchByFilePath(_ filePath: String, sourceType: Transcription.SourceType?) throws -> [Transcription]
+    func fetchMeetings(withStatus status: Transcription.TranscriptionStatus) throws -> [Transcription]
+    func fetchMeetingAudioRetentionCandidates(createdAtOrBefore cutoff: Date) throws -> [Transcription]
+    func fetchCompletedByVideoID(_ videoID: String) throws -> Transcription?
+    func count() throws -> Int
+    func search(query: String, limit: Int?) throws -> [Transcription]
+    func delete(id: UUID) throws -> Bool
+    func deleteAll() throws
+    func updateStatus(id: UUID, status: Transcription.TranscriptionStatus, errorMessage: String?) throws
+    @discardableResult
+    func updateFileName(id: UUID, fileName: String) throws -> Transcription?
+    func updateTitleOverride(id: UUID, titleOverride: String?) throws
+    func updateMeetingType(id: UUID, meetingTypeId: UUID?) throws
+    func updateChatMessages(id: UUID, chatMessages: [ChatMessage]?) throws
+    func updateSpeakers(id: UUID, speakers: [SpeakerInfo]?) throws
+    @discardableResult
+    func updateUserNotes(id: UUID, userNotes: String?) throws -> Bool
+    func updateFilePath(id: UUID, filePath: String?) throws
+    func updateMeetingArtifactFolderPath(id: UUID, folderPath: String?) throws
+    func clearStoredAudioPathsForURLTranscriptions() throws
+    @discardableResult
+    func clearStoredAudioPathsForMeetingTranscriptions(under directoryPath: String) throws -> [UUID]
+    func updateFavorite(id: UUID, isFavorite: Bool) throws
+    func fetchFavorites() throws -> [Transcription]
+}
+
+extension TranscriptionRepositoryProtocol {
+    public func savePreservingMeetingClassification(_ transcription: Transcription) throws {
+        try save(transcription)
+    }
+
+    public func fetchByFilePath(
+        _ filePath: String,
+        sourceType: Transcription.SourceType? = nil
+    ) throws -> [Transcription] {
+        try fetchAll(limit: nil).filter {
+            $0.filePath == filePath
+                && (sourceType == nil || $0.sourceType == sourceType)
+        }
+    }
+
+    public func fetchMeetingAudioRetentionCandidates(createdAtOrBefore cutoff: Date) throws -> [Transcription] {
+        try fetchAll(limit: nil).filter {
+            $0.sourceType == .meeting
+                && !($0.filePath?.isEmpty ?? true)
+                && $0.status == .completed
+                && $0.createdAt <= cutoff
+        }
+    }
+
+    public func fetchMeetings(withStatus status: Transcription.TranscriptionStatus) throws -> [Transcription] {
+        try fetchAll(limit: nil).filter {
+            $0.sourceType == .meeting && $0.status == status
+        }
+    }
+
+    public func fetchCompletedByVideoID(_ videoID: String) throws -> Transcription? { nil }
+    public func count() throws -> Int { try fetchAll(limit: nil).count }
+    public func search(query: String, limit: Int?) throws -> [Transcription] { [] }
+    public func fetchLibraryPage(query: TranscriptionLibraryQuery) throws -> TranscriptionLibraryPage {
+        var results = try fetchAll(limit: nil)
+
+        if !query.includeProcessing {
+            results = results.filter {
+                $0.status != .processing
+                    || (query.includeProcessingMeetings && $0.sourceType == .meeting)
+            }
+        }
+        if let sourceType = query.sourceType {
+            results = results.filter { $0.sourceType == sourceType }
+        }
+        if query.favoritesOnly {
+            results = results.filter(\.isFavorite)
+        }
+        if !query.meetingTypeIDs.isEmpty {
+            results = results.filter { transcription in
+                transcription.meetingTypeId.map(query.meetingTypeIDs.contains) ?? false
+            }
+        }
+        if query.unclassifiedMeetingsOnly {
+            results = results.filter {
+                $0.sourceType == .meeting && $0.meetingTypeId == nil
+            }
+        }
+        // Generic protocol fallbacks do not have access to the label join
+        // table. Concrete SQL repositories implement this filter. Returning no
+        // rows is safer than silently ignoring an explicitly requested label.
+        if !query.meetingLabelIDs.isEmpty {
+            results = []
+        }
+        if let searchText = query.searchText?.trimmingCharacters(in: .whitespacesAndNewlines),
+            !searchText.isEmpty
+        {
+            let normalizedQuery = UnicodeSearch.makeKey(searchText)
+            results = results.filter { transcription in
+                transcriptionMatchesLibrarySearch(transcription, normalizedQuery: normalizedQuery)
+            }
+        }
+
+        switch query.sortOrder {
+        case .dateDescending:
+            results.sort { $0.createdAt > $1.createdAt }
+        case .dateAscending:
+            results.sort { $0.createdAt < $1.createdAt }
+        case .titleAscending:
+            results.sort {
+                let comparison = $0.effectiveDisplayTitle.localizedCaseInsensitiveCompare($1.effectiveDisplayTitle)
+                if comparison == .orderedSame {
+                    return $0.createdAt > $1.createdAt
+                }
+                return comparison == .orderedAscending
+            }
+        }
+
+        let limit = max(0, query.limit)
+        let offset = max(0, query.offset)
+        guard offset < results.count else {
+            return TranscriptionLibraryPage(items: [], hasMore: false)
+        }
+        let end = min(results.count, offset + limit)
+        return TranscriptionLibraryPage(
+            items: Array(results[offset..<end]),
+            hasMore: results.count > end
+        )
+    }
+    public func clearStoredAudioPathsForURLTranscriptions() throws {}
+    @discardableResult
+    public func clearStoredAudioPathsForMeetingTranscriptions(under directoryPath: String) throws -> [UUID] { [] }
+    @discardableResult
+    public func updateFileName(id: UUID, fileName: String) throws -> Transcription? { nil }
+    public func updateTitleOverride(id: UUID, titleOverride: String?) throws {}
+    public func updateMeetingType(id: UUID, meetingTypeId: UUID?) throws {}
+    public func updateChatMessages(id: UUID, chatMessages: [ChatMessage]?) throws {}
+    public func updateSpeakers(id: UUID, speakers: [SpeakerInfo]?) throws {}
+    @discardableResult
+    public func updateUserNotes(id: UUID, userNotes: String?) throws -> Bool {
+        guard var transcription = try fetch(id: id) else { return false }
+        transcription.userNotes = userNotes
+        transcription.updatedAt = Date()
+        try save(transcription)
+        return true
+    }
+    public func updateFilePath(id: UUID, filePath: String?) throws {}
+    public func updateMeetingArtifactFolderPath(id: UUID, folderPath: String?) throws {}
+    public func updateFavorite(id: UUID, isFavorite: Bool) throws {}
+    public func fetchFavorites() throws -> [Transcription] { [] }
+}
+
+// GRDB's DatabaseQueue serializes reads/writes internally, so sharing this
+// repository across tasks is intentional even though DatabaseQueue does not
+// advertise Swift Sendable conformance.
+public final class TranscriptionRepository: TranscriptionRepositoryProtocol, @unchecked Sendable {
+    private let dbQueue: DatabaseQueue
+    private static let libraryDisplayTitleExpression = effectiveDisplayTitleExpression()
+
+    static func effectiveDisplayTitleExpression(tableAlias: String? = nil) -> String {
+        let prefix = tableAlias.map { "\($0)." } ?? ""
+        return """
+            COALESCE(
+                CASE
+                    WHEN \(prefix)sourceType = 'meeting' THEN NULL
+                    ELSE NULLIF(TRIM(\(prefix)titleOverride), '')
+                END,
+                CASE
+                    WHEN \(prefix)sourceType = 'meeting' THEN COALESCE(
+                        NULLIF(TRIM(\(prefix)fileName), ''),
+                        \(prefix)fileName
+                    )
+                    WHEN \(prefix)sourceType = 'file' THEN \(prefix)fileName
+                    ELSE COALESCE(NULLIF(TRIM(\(prefix)derivedTitle), ''), \(prefix)fileName)
+                END
+            )
+            """
+    }
+
+    public init(dbQueue: DatabaseQueue) {
+        self.dbQueue = dbQueue
+    }
+
+    public func save(_ transcription: Transcription) throws {
+        try dbQueue.write { db in
+            try transcription.save(db)
+        }
+    }
+
+    public func savePreservingMeetingClassification(_ transcription: Transcription) throws {
+        _ = try savePreservingUserMetadata(transcription, originalFileName: transcription.fileName)
+    }
+
+    public func savePreservingUserMetadata(
+        _ transcription: Transcription, originalFileName: String
+    ) throws -> Transcription {
+        try dbQueue.write { db in
+            guard let current = try Transcription.fetchOne(db, key: transcription.id) else {
+                throw TranscriptionCompletionError.recordingDeleted
+            }
+            let merged = transcription.preservingUserMetadata(
+                from: current, originalFileName: originalFileName
+            )
+            try merged.save(db)
+            return merged
+        }
+    }
+
+    public func fetch(id: UUID) throws -> Transcription? {
+        try dbQueue.read { db in
+            try Transcription.fetchOne(db, key: id)
+        }
+    }
+
+    public func fetchAll(limit: Int? = nil) throws -> [Transcription] {
+        try dbQueue.read { db in
+            var request =
+                Transcription
+                .order(Transcription.Columns.createdAt.desc)
+            if let limit {
+                request = request.limit(limit)
+            }
+            return try request.fetchAll(db)
+        }
+    }
+
+    public func fetchLibraryPage(query: TranscriptionLibraryQuery) throws -> TranscriptionLibraryPage {
+        try dbQueue.read { db in
+            let limit = max(0, query.limit)
+            let offset = max(0, query.offset)
+            let fetchLimit = limit == Int.max ? Int.max : limit + 1
+            var whereClauses: [String] = []
+            var arguments: [any DatabaseValueConvertible] = []
+
+            if !query.includeProcessing {
+                if query.includeProcessingMeetings {
+                    whereClauses.append("(status != ? OR sourceType = ?)")
+                    arguments.append(Transcription.TranscriptionStatus.processing.rawValue)
+                    arguments.append(Transcription.SourceType.meeting.rawValue)
+                } else {
+                    whereClauses.append("status != ?")
+                    arguments.append(Transcription.TranscriptionStatus.processing.rawValue)
+                }
+            }
+            if let sourceType = query.sourceType {
+                whereClauses.append("sourceType = ?")
+                arguments.append(sourceType.rawValue)
+            }
+            if query.favoritesOnly {
+                whereClauses.append("isFavorite = 1")
+            }
+            if !query.meetingTypeIDs.isEmpty {
+                let placeholders = Array(repeating: "?", count: query.meetingTypeIDs.count)
+                    .joined(separator: ", ")
+                whereClauses.append("meetingTypeId IN (\(placeholders))")
+                arguments.append(contentsOf: query.meetingTypeIDs.map { $0 as any DatabaseValueConvertible })
+            }
+            if query.unclassifiedMeetingsOnly {
+                whereClauses.append("sourceType = ?")
+                arguments.append(Transcription.SourceType.meeting.rawValue)
+                whereClauses.append("meetingTypeId IS NULL")
+            }
+            if !query.meetingLabelIDs.isEmpty {
+                let placeholders = Array(repeating: "?", count: query.meetingLabelIDs.count)
+                    .joined(separator: ", ")
+                whereClauses.append(
+                    "EXISTS (SELECT 1 FROM transcription_meeting_labels tml "
+                        + "WHERE tml.transcriptionId = transcriptions.id "
+                        + "AND tml.labelId IN (\(placeholders)))"
+                )
+                arguments.append(contentsOf: query.meetingLabelIDs.map { $0 as any DatabaseValueConvertible })
+            }
+            if let searchText = query.searchText?.trimmingCharacters(in: .whitespacesAndNewlines),
+                !searchText.isEmpty
+            {
+                return try Self.fetchUnicodeSearchLibraryPage(
+                    db: db,
+                    whereClauses: whereClauses,
+                    arguments: arguments,
+                    normalizedQuery: UnicodeSearch.makeKey(searchText),
+                    sortOrder: query.sortOrder,
+                    limit: limit,
+                    offset: offset
+                )
+            }
+
+            var sql = "SELECT * FROM transcriptions"
+            if !whereClauses.isEmpty {
+                sql += " WHERE " + whereClauses.joined(separator: " AND ")
+            }
+            sql += " ORDER BY \(Self.libraryOrderClause(for: query.sortOrder))"
+            sql += " LIMIT ? OFFSET ?"
+            arguments.append(fetchLimit)
+            arguments.append(offset)
+
+            let fetched = try Transcription.fetchAll(
+                db,
+                sql: sql,
+                arguments: StatementArguments(arguments)
+            )
+            return TranscriptionLibraryPage(
+                items: limit == 0 ? [] : Array(fetched.prefix(limit)),
+                hasMore: fetched.count > limit
+            )
+        }
+    }
+
+    private static func fetchUnicodeSearchLibraryPage(
+        db: Database,
+        whereClauses: [String],
+        arguments: [any DatabaseValueConvertible],
+        normalizedQuery: String,
+        sortOrder: TranscriptionLibrarySortOrder,
+        limit: Int,
+        offset: Int
+    ) throws -> TranscriptionLibraryPage {
+        var sql = "SELECT * FROM transcriptions"
+        if !whereClauses.isEmpty {
+            sql += " WHERE " + whereClauses.joined(separator: " AND ")
+        }
+        sql += " ORDER BY \(Self.libraryOrderClause(for: sortOrder))"
+
+        let cursor = try Transcription.fetchCursor(
+            db,
+            sql: sql,
+            arguments: StatementArguments(arguments)
+        )
+        var skipped = 0
+        var items: [Transcription] = []
+        while let transcription = try cursor.next() {
+            guard transcriptionMatchesLibrarySearch(transcription, normalizedQuery: normalizedQuery) else {
+                continue
+            }
+            if skipped < offset {
+                skipped += 1
+                continue
+            }
+            guard items.count < limit else {
+                return TranscriptionLibraryPage(items: items, hasMore: true)
+            }
+            items.append(transcription)
+        }
+        return TranscriptionLibraryPage(items: items, hasMore: false)
+    }
+
+    public func fetchBySourceType(_ sourceType: Transcription.SourceType, limit: Int? = nil) throws -> [Transcription] {
+        try dbQueue.read { db in
+            var request =
+                Transcription
+                .filter(Transcription.Columns.sourceType == sourceType.rawValue)
+                .order(Transcription.Columns.createdAt.desc)
+            if let limit {
+                request = request.limit(limit)
+            }
+            return try request.fetchAll(db)
+        }
+    }
+
+    public func fetchByIDPrefix(_ idPrefix: String) throws -> [Transcription] {
+        try fetchByIDPrefix(idPrefix, sourceType: nil)
+    }
+
+    public func fetchBySourceType(
+        _ sourceType: Transcription.SourceType,
+        idPrefix: String
+    ) throws -> [Transcription] {
+        try fetchByIDPrefix(idPrefix, sourceType: sourceType)
+    }
+
+    private func fetchByIDPrefix(
+        _ idPrefix: String,
+        sourceType: Transcription.SourceType?
+    ) throws -> [Transcription] {
+        let trimmed = idPrefix.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+        let compactPattern = escapedLikePattern(trimmed.lowercased().replacingOccurrences(of: "-", with: "")) + "%"
+        var sql = """
+            (lower(hex(id)) LIKE ? ESCAPE '\\'
+                OR replace(lower(id), '-', '') LIKE ? ESCAPE '\\')
+            """
+        var arguments: [String] = [compactPattern, compactPattern]
+        if let sourceType {
+            sql = "sourceType = ? AND \(sql)"
+            arguments.insert(sourceType.rawValue, at: 0)
+        }
+        return try dbQueue.read { db in
+            try Transcription
+                .filter(sql: sql, arguments: StatementArguments(arguments))
+                .order(Transcription.Columns.createdAt.desc)
+                .fetchAll(db)
+        }
+    }
+
+    public func fetchByFileName(_ fileName: String) throws -> [Transcription] {
+        try fetchByFileName(fileName, sourceType: nil)
+    }
+
+    public func fetchBySourceType(
+        _ sourceType: Transcription.SourceType,
+        fileName: String
+    ) throws -> [Transcription] {
+        try fetchByFileName(fileName, sourceType: sourceType)
+    }
+
+    private func fetchByFileName(
+        _ fileName: String,
+        sourceType: Transcription.SourceType?
+    ) throws -> [Transcription] {
+        let trimmed = fileName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+        var sql = "lower(fileName) = lower(?)"
+        var arguments: [String] = [trimmed]
+        if let sourceType {
+            sql = "sourceType = ? AND \(sql)"
+            arguments.insert(sourceType.rawValue, at: 0)
+        }
+        return try dbQueue.read { db in
+            try Transcription
+                .filter(sql: sql, arguments: StatementArguments(arguments))
+                .order(Transcription.Columns.createdAt.desc)
+                .fetchAll(db)
+        }
+    }
+
+    public func fetchByFilePath(
+        _ filePath: String,
+        sourceType: Transcription.SourceType? = nil
+    ) throws -> [Transcription] {
+        try dbQueue.read { db in
+            var request =
+                Transcription
+                .filter(Transcription.Columns.filePath == filePath)
+                .order(Transcription.Columns.createdAt.desc)
+            if let sourceType {
+                request = request.filter(Transcription.Columns.sourceType == sourceType.rawValue)
+            }
+            return try request.fetchAll(db)
+        }
+    }
+
+    public func fetchMeetings(withStatus status: Transcription.TranscriptionStatus) throws -> [Transcription] {
+        try dbQueue.read { db in
+            try Transcription
+                .filter(Transcription.Columns.sourceType == Transcription.SourceType.meeting.rawValue)
+                .filter(Transcription.Columns.status == status.rawValue)
+                .order(Transcription.Columns.createdAt.desc)
+                .fetchAll(db)
+        }
+    }
+
+    public func fetchMeetingAudioRetentionCandidates(createdAtOrBefore cutoff: Date) throws -> [Transcription] {
+        try dbQueue.read { db in
+            try Transcription
+                .filter(Transcription.Columns.sourceType == Transcription.SourceType.meeting.rawValue)
+                .filter(Transcription.Columns.filePath != nil)
+                .filter(Transcription.Columns.filePath != "")
+                .filter(Transcription.Columns.status == Transcription.TranscriptionStatus.completed.rawValue)
+                .filter(Transcription.Columns.createdAt <= cutoff)
+                .order(Transcription.Columns.createdAt.asc)
+                .fetchAll(db)
+        }
+    }
+
+    public func count() throws -> Int {
+        try dbQueue.read { db in
+            try Transcription.fetchCount(db)
+        }
+    }
+
+    public func search(query: String, limit: Int? = nil) throws -> [Transcription] {
+        try dbQueue.read { db in
+            let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return [] }
+
+            let normalizedQuery = UnicodeSearch.makeKey(trimmed)
+            let cursor =
+                try Transcription
+                .order(Transcription.Columns.createdAt.desc)
+                .fetchCursor(db)
+
+            var results: [Transcription] = []
+            while let transcription = try cursor.next() {
+                guard transcriptionMatchesLibrarySearch(transcription, normalizedQuery: normalizedQuery) else {
+                    continue
+                }
+
+                results.append(transcription)
+                if let limit, results.count >= limit {
+                    break
+                }
+            }
+            return results
+        }
+    }
+
+    public func fetchCompletedByVideoID(_ videoID: String) throws -> Transcription? {
+        let trimmed = videoID.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return nil }
+
+        // Escape LIKE wildcards (% and _) so video IDs containing _ match literally
+        let escaped =
+            trimmed
+            .replacingOccurrences(of: "%", with: "\\%")
+            .replacingOccurrences(of: "_", with: "\\_")
+
+        return try dbQueue.read { db in
+            try Transcription
+                .filter(Transcription.Columns.sourceURL != nil)
+                .filter(Transcription.Columns.status == Transcription.TranscriptionStatus.completed.rawValue)
+                .filter(Transcription.Columns.sourceURL.like("%\(escaped)%", escape: "\\"))
+                .order(Transcription.Columns.createdAt.desc)
+                .fetchOne(db)
+        }
+    }
+
+    public func delete(id: UUID) throws -> Bool {
+        try dbQueue.write { db in
+            try Transcription.deleteOne(db, key: id)
+        }
+    }
+
+    public func deleteAll() throws {
+        try dbQueue.write { db in
+            _ = try Transcription.deleteAll(db)
+        }
+    }
+
+    public func updateStatus(
+        id: UUID,
+        status: Transcription.TranscriptionStatus,
+        errorMessage: String? = nil
+    ) throws {
+        try dbQueue.write { db in
+            guard var transcription = try Transcription.fetchOne(db, key: id) else { return }
+            transcription.status = status
+            transcription.errorMessage = errorMessage
+            transcription.updatedAt = Date()
+            try transcription.update(db)
+        }
+    }
+
+    @discardableResult
+    public func transitionStatus(
+        id: UUID,
+        from expectedStatus: Transcription.TranscriptionStatus,
+        to status: Transcription.TranscriptionStatus,
+        errorMessage: String? = nil
+    ) throws -> Bool {
+        try dbQueue.write { db in
+            guard var transcription = try Transcription.fetchOne(db, key: id),
+                transcription.status == expectedStatus
+            else {
+                return false
+            }
+            transcription.status = status
+            transcription.errorMessage = errorMessage
+            transcription.updatedAt = Date()
+            try transcription.update(db)
+            return true
+        }
+    }
+
+    @discardableResult
+    public func updateFileName(id: UUID, fileName: String) throws -> Transcription? {
+        try dbQueue.write { db in
+            guard var transcription = try Transcription.fetchOne(db, key: id) else { return nil }
+            transcription.fileName = fileName
+            // A user-driven rename (meetings only) is the source of truth for
+            // the meeting's name. The Library rows already read `fileName` for
+            // meetings, but `derivedTitle` still feeds the "Save Audio As…"
+            // export-filename helper — mirror the rename into it so the
+            // suggested export name follows the new title instead of the stale
+            // transcript-content title.
+            transcription.derivedTitle = fileName
+            transcription.updatedAt = Date()
+            try transcription.update(db)
+            return transcription
+        }
+    }
+
+    public func updateTitleOverride(id: UUID, titleOverride: String?) throws {
+        let normalizedTitle = Transcription.normalizedTitleOverride(from: titleOverride)
+        try dbQueue.write { db in
+            guard var transcription = try Transcription.fetchOne(db, key: id) else { return }
+            guard transcription.sourceType == .file else { return }
+            guard transcription.normalizedTitleOverride != normalizedTitle else { return }
+            transcription.titleOverride = normalizedTitle
+            transcription.updatedAt = Date()
+            try transcription.update(db)
+        }
+    }
+
+    public func updateMeetingType(id: UUID, meetingTypeId: UUID?) throws {
+        try dbQueue.write { db in
+            guard var transcription = try Transcription.fetchOne(db, key: id),
+                transcription.sourceType == .meeting
+            else { return }
+            guard transcription.meetingTypeId != meetingTypeId else { return }
+            transcription.meetingTypeId = meetingTypeId
+            transcription.updatedAt = Date()
+            try transcription.update(db)
+        }
+    }
+
+    public func updateChatMessages(id: UUID, chatMessages: [ChatMessage]?) throws {
+        try dbQueue.write { db in
+            guard var transcription = try Transcription.fetchOne(db, key: id) else { return }
+            transcription.chatMessages = chatMessages
+            transcription.updatedAt = Date()
+            try transcription.update(db)
+        }
+    }
+
+    public func updateSpeakers(id: UUID, speakers: [SpeakerInfo]?) throws {
+        try dbQueue.write { db in
+            guard var transcription = try Transcription.fetchOne(db, key: id) else { return }
+            transcription.speakers = speakers
+            transcription.transcriptSegments = TranscriptSegmentRecord.updatingSpeakerLabels(
+                in: transcription.transcriptSegments,
+                using: speakers
+            )
+            transcription.updatedAt = Date()
+            try transcription.update(db)
+        }
+    }
+
+    @discardableResult
+    public func updateUserNotes(id: UUID, userNotes: String?) throws -> Bool {
+        try dbQueue.write { db in
+            guard var transcription = try Transcription.fetchOne(db, key: id) else { return false }
+            transcription.userNotes = userNotes
+            transcription.updatedAt = Date()
+            try transcription.update(db)
+            return true
+        }
+    }
+
+    public func updateFilePath(id: UUID, filePath: String?) throws {
+        try dbQueue.write { db in
+            guard var transcription = try Transcription.fetchOne(db, key: id) else { return }
+            transcription.filePath = filePath
+            if transcription.sourceType == .meeting,
+                transcription.meetingArtifactFolderPath == nil,
+                let filePath,
+                let folderPath = Self.artifactFolderPath(forAudioPath: filePath)
+            {
+                transcription.meetingArtifactFolderPath = folderPath
+            }
+            transcription.updatedAt = Date()
+            try transcription.update(db)
+        }
+    }
+
+    public func updateMeetingArtifactFolderPath(id: UUID, folderPath: String?) throws {
+        try dbQueue.write { db in
+            guard var transcription = try Transcription.fetchOne(db, key: id),
+                transcription.sourceType == .meeting
+            else { return }
+            transcription.meetingArtifactFolderPath = Self.normalizedPath(folderPath)
+            transcription.updatedAt = Date()
+            try transcription.update(db)
+        }
+    }
+
+    public func clearStoredAudioPathsForURLTranscriptions() throws {
+        try dbQueue.write { db in
+            try db.execute(
+                sql: "UPDATE transcriptions SET filePath = NULL WHERE sourceURL IS NOT NULL"
+            )
+        }
+    }
+
+    @discardableResult
+    public func clearStoredAudioPathsForMeetingTranscriptions(under directoryPath: String) throws -> [UUID] {
+        try dbQueue.write { db in
+            let now = Date()
+            let meetings =
+                try Transcription
+                .filter(Transcription.Columns.sourceType == Transcription.SourceType.meeting.rawValue)
+                .fetchAll(db)
+
+            var clearedIDs: [UUID] = []
+            for var transcription in meetings {
+                guard let filePath = transcription.filePath,
+                    Self.isFilePath(filePath, underDirectory: directoryPath)
+                else {
+                    continue
+                }
+                if transcription.meetingArtifactFolderPath == nil {
+                    transcription.meetingArtifactFolderPath = Self.artifactFolderPath(forAudioPath: filePath)
+                }
+                transcription.filePath = nil
+                transcription.updatedAt = now
+                try transcription.update(db)
+                clearedIDs.append(transcription.id)
+            }
+            return clearedIDs
+        }
+    }
+
+    public func updateFavorite(id: UUID, isFavorite: Bool) throws {
+        try dbQueue.write { db in
+            try db.execute(
+                sql: "UPDATE transcriptions SET isFavorite = ?, updatedAt = ? WHERE id = ?",
+                arguments: [isFavorite, Date(), id]
+            )
+        }
+    }
+
+    public func fetchFavorites() throws -> [Transcription] {
+        try dbQueue.read { db in
+            try Transcription
+                .filter(Transcription.Columns.isFavorite == true)
+                .order(Transcription.Columns.createdAt.desc)
+                .fetchAll(db)
+        }
+    }
+
+    private static func isFilePath(_ filePath: String, underDirectory directoryPath: String) -> Bool {
+        let root = URL(fileURLWithPath: directoryPath, isDirectory: true).standardizedFileURL.path
+        let target = URL(fileURLWithPath: filePath).standardizedFileURL.path
+        return target.hasPrefix(root + "/")
+    }
+
+    private static func artifactFolderPath(forAudioPath filePath: String) -> String? {
+        let trimmed = filePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return URL(fileURLWithPath: trimmed)
+            .deletingLastPathComponent()
+            .standardizedFileURL
+            .path
+    }
+
+    private static func normalizedPath(_ path: String?) -> String? {
+        guard let trimmed = path?.trimmingCharacters(in: .whitespacesAndNewlines),
+            !trimmed.isEmpty
+        else {
+            return nil
+        }
+        return URL(fileURLWithPath: trimmed).standardizedFileURL.path
+    }
+
+    private static func libraryOrderClause(for sortOrder: TranscriptionLibrarySortOrder) -> String {
+        switch sortOrder {
+        case .dateDescending:
+            return "createdAt DESC"
+        case .dateAscending:
+            return "createdAt ASC"
+        case .titleAscending:
+            return "\(libraryDisplayTitleExpression) COLLATE NOCASE ASC, createdAt DESC"
+        }
+    }
+}
+
+private func escapedLikePattern(_ value: String) -> String {
+    value
+        .replacingOccurrences(of: "\\", with: "\\\\")
+        .replacingOccurrences(of: "%", with: "\\%")
+        .replacingOccurrences(of: "_", with: "\\_")
+}
+
+private func transcriptionMatchesLibrarySearch(
+    _ transcription: Transcription,
+    normalizedQuery: String
+) -> Bool {
+    UnicodeSearch.contains(transcription.effectiveDisplayTitle, normalizedQuery: normalizedQuery)
+        || UnicodeSearch.contains(transcription.fileName, normalizedQuery: normalizedQuery)
+        || (transcription.derivedTitle.map { UnicodeSearch.contains($0, normalizedQuery: normalizedQuery) } ?? false)
+        || (transcription.rawTranscript.map { UnicodeSearch.contains($0, normalizedQuery: normalizedQuery) } ?? false)
+        || (transcription.cleanTranscript.map { UnicodeSearch.contains($0, normalizedQuery: normalizedQuery) } ?? false)
+        || (transcription.channelName.map { UnicodeSearch.contains($0, normalizedQuery: normalizedQuery) } ?? false)
+}
+
+private extension Transcription {
+    /// STT owns transcript output, not metadata edited while processing is suspended.
+    func preservingUserMetadata(from current: Transcription, originalFileName: String) -> Transcription {
+        var merged = self
+        merged.updatedAt = max(updatedAt, current.updatedAt)
+        merged.userNotes = current.userNotes
+        merged.meetingTypeId = current.meetingTypeId
+        merged.isFavorite = current.isFavorite
+        merged.titleOverride = current.titleOverride
+        merged.chatMessages = current.chatMessages
+        merged.meetingArtifactFolderPath = current.meetingArtifactFolderPath
+        merged.filePath = current.filePath
+        // Allow an automatically generated meeting title only if the user has
+        // not renamed the row since the processing snapshot was captured.
+        if current.fileName != originalFileName {
+            merged.fileName = current.fileName
+            if current.sourceType == .meeting {
+                merged.derivedTitle = current.derivedTitle
+            }
+        }
+        return merged
+    }
+}

@@ -1,0 +1,1855 @@
+import XCTest
+@testable import MacParakeetCore
+@testable import MacParakeetViewModels
+
+@MainActor
+final class PromptResultsViewModelTests: XCTestCase {
+    var viewModel: PromptResultsViewModel!
+    var llm: MockLLMService!
+    var promptRepo: MockPromptRepository!
+    var promptResultRepo: MockPromptResultRepository!
+    var transcriptionRepo: MockTranscriptionRepository!
+
+    override func setUp() {
+        viewModel = PromptResultsViewModel()
+        llm = MockLLMService()
+        promptRepo = MockPromptRepository()
+        promptResultRepo = MockPromptResultRepository()
+        transcriptionRepo = MockTranscriptionRepository()
+        promptRepo.prompts = Prompt.builtInPrompts()
+    }
+
+    private func waitUntil(
+        timeout: Duration = .seconds(1),
+        pollInterval: Duration = .milliseconds(10),
+        file: StaticString = #filePath,
+        line: UInt = #line,
+        _ condition: () -> Bool
+    ) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now + timeout
+        while !condition() {
+            if clock.now >= deadline {
+                XCTFail("Timed out waiting for condition", file: file, line: line)
+                return
+            }
+            try await Task.sleep(for: pollInterval)
+        }
+    }
+
+    func testGenerationCapabilityIsFalseBeforeAIConfigured() {
+        XCTAssertFalse(viewModel.hasPromptResultGenerationCapability)
+        XCTAssertFalse(viewModel.canGeneratePromptResult)
+        XCTAssertFalse(viewModel.canGenerateManualPromptResult)
+    }
+
+    func testConfigureLoadsVisiblePromptsAndDefaultSelection() {
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo
+        )
+
+        // After ADR-020's 2026-05-02 amendment reverted "Memo-Steered Notes",
+        // "Summary" is sortOrder=0 and isAutoRun=true, so it is the
+        // auto-selected default when no prior selection exists.
+        XCTAssertTrue(viewModel.visiblePrompts.contains { $0.name == "Summary" })
+        XCTAssertEqual(viewModel.selectedPrompt?.name, "Summary")
+        XCTAssertTrue(viewModel.canGeneratePromptResult)
+        XCTAssertTrue(viewModel.canGenerateManualPromptResult)
+    }
+
+    func testSelectedPromptInferenceCompatibilityUsesModelOverrideWhenSettingsAreNil() {
+        let store = MockLLMConfigStore()
+        store.config = .gemini(apiKey: "key", model: "gemini-3.5-flash")
+        let prompt = Prompt(
+            name: "Override only",
+            content: "Summarize.",
+            modelOverride: "claude-sonnet-5"
+        )
+        promptRepo.prompts = [prompt]
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo,
+            configStore: store
+        )
+        viewModel.selectedPrompt = prompt
+
+        XCTAssertNil(viewModel.selectedPromptInferenceSummary)
+        XCTAssertEqual(
+            viewModel.selectedPromptInferenceCompatibilityMessage,
+            "This prompt's model isn't available with Google Gemini: the model identifier does not match this provider."
+        )
+    }
+
+    func testSelectedPromptInferenceCompatibilityUsesOverrideForUnsupportedSampling() {
+        let store = MockLLMConfigStore()
+        store.config = .openai(apiKey: "key", model: "gpt-4.1")
+        let prompt = Prompt(
+            name: "Sampling",
+            content: "Summarize.",
+            inferenceSettings: PromptInferenceSettings(temperature: 0.2),
+            modelOverride: "gpt-5.5"
+        )
+        promptRepo.prompts = [prompt]
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo,
+            configStore: store
+        )
+        viewModel.selectedPrompt = prompt
+
+        XCTAssertEqual(
+            viewModel.selectedPromptInferenceCompatibilityMessage,
+            "Not applied with this provider/model and setting combination: Temperature."
+        )
+    }
+
+    func testSelectedPromptInferenceCompatibilityIsSilentForInheritedModelWithoutSettings() {
+        let store = MockLLMConfigStore()
+        store.config = .openai(apiKey: "key", model: "gpt-5.5")
+        let prompt = Prompt(name: "Plain", content: "Summarize.")
+        promptRepo.prompts = [prompt]
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo,
+            configStore: store
+        )
+        viewModel.selectedPrompt = prompt
+
+        XCTAssertNil(viewModel.selectedPromptInferenceCompatibilityMessage)
+    }
+
+    func testRefreshModelInfoLoadsDiscoveredOllamaModelsForPromptSelector() async throws {
+        let configStore = MockLLMConfigStore()
+        configStore.config = .ollama(model: "mistral:latest")
+        let llmClient = MockLLMClient()
+        llmClient.modelsList = ["llama3.2:latest", "mistral:latest"]
+
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo,
+            configStore: configStore,
+            llmClient: llmClient
+        )
+
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        XCTAssertEqual(viewModel.currentProviderID, .ollama)
+        XCTAssertEqual(viewModel.currentModelName, "mistral:latest")
+        XCTAssertEqual(viewModel.availableModels, ["llama3.2:latest", "mistral:latest"])
+        XCTAssertEqual(llmClient.capturedContext?.providerConfig.id, .ollama)
+    }
+
+    func testGeneratePromptResultPersistsCustomPromptResult() async throws {
+        let transcriptionID = UUID()
+        let prompt = Prompt(
+            name: "Action Items",
+            content: "Extract action items only.",
+            category: .result,
+            isBuiltIn: false,
+            sortOrder: 99
+        )
+        promptRepo.prompts.append(prompt)
+
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo
+        )
+        viewModel.selectedPrompt = prompt
+        viewModel.extraInstructions = "Return terse bullet points."
+        llm.streamTokens = ["Task ", "one"]
+
+        viewModel.generatePromptResult(
+            transcript: "Alice will send the draft tomorrow.",
+            transcriptionId: transcriptionID
+        )
+
+        try await Task.sleep(for: .milliseconds(200))
+
+        XCTAssertEqual(promptResultRepo.saveCalls.count, 1)
+        XCTAssertEqual(promptResultRepo.saveCalls[0].transcriptionId, transcriptionID)
+        XCTAssertEqual(promptResultRepo.saveCalls[0].promptName, "Action Items")
+        XCTAssertEqual(promptResultRepo.saveCalls[0].extraInstructions, "Return terse bullet points.")
+        XCTAssertEqual(promptResultRepo.saveCalls[0].content, "Task one")
+        XCTAssertEqual(
+            llm.lastSummarySystemPrompt,
+            "Extract action items only.\n\nReturn terse bullet points."
+        )
+        XCTAssertEqual(viewModel.promptResults.first?.content, "Task one")
+    }
+
+    func testGenerationSnapshotsRequestedSettingsAndPersistsTerminalEffectiveSettings() async throws {
+        let promptID = UUID()
+        let versionID = UUID()
+        let requested = PromptInferenceSettings(
+            temperature: 0.2,
+            maxTokens: 400,
+            thinkingMode: .enabled
+        )
+        let effective = PromptInferenceSettings(temperature: 0.2, maxTokens: 400)
+        let prompt = Prompt(
+            id: promptID,
+            name: "Configured",
+            content: "Summarize.",
+            inferenceSettings: requested,
+            activeVersionId: versionID,
+            modelOverride: "prompt-model"
+        )
+        promptRepo.prompts = [prompt]
+        llm.streamTokens = ["Done"]
+        llm.streamDelayNs = 100_000_000
+        llm.streamEffectiveSettings = effective
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo
+        )
+
+        let generationID = try XCTUnwrap(
+            viewModel.generatePromptResult(transcript: "Transcript", transcriptionId: UUID())
+        )
+
+        XCTAssertEqual(viewModel.pendingGeneration(id: generationID)?.inferenceSettings, requested)
+        XCTAssertEqual(viewModel.pendingGeneration(id: generationID)?.promptId, promptID)
+        XCTAssertEqual(viewModel.pendingGeneration(id: generationID)?.promptVersionId, versionID)
+        XCTAssertEqual(viewModel.pendingGeneration(id: generationID)?.modelSnapshot, "prompt-model")
+        viewModel.selectedPrompt?.inferenceSettings = PromptInferenceSettings(temperature: 1.5)
+        viewModel.selectedPrompt?.activeVersionId = UUID()
+        viewModel.selectedPrompt?.modelOverride = "edited-model"
+
+        try await waitUntil { self.promptResultRepo.saveCalls.count == 1 }
+
+        XCTAssertEqual(llm.lastSummaryInferenceSettings, requested)
+        XCTAssertEqual(llm.lastSummaryModelOverride, "prompt-model")
+        XCTAssertEqual(promptResultRepo.saveCalls[0].inferenceSettingsSnapshot, effective)
+        XCTAssertEqual(promptResultRepo.saveCalls[0].promptId, promptID)
+        XCTAssertEqual(promptResultRepo.saveCalls[0].promptVersionId, versionID)
+        XCTAssertEqual(promptResultRepo.saveCalls[0].providerSnapshot, "mock")
+        XCTAssertEqual(promptResultRepo.saveCalls[0].modelSnapshot, "mock-model")
+    }
+
+    func testQueuedGenerationKeepsModelCapturedBeforeGlobalModelChanges() async throws {
+        let configStore = MockLLMConfigStore()
+        configStore.config = .openai(apiKey: "test", model: "model-before-enqueue")
+        let prompt = Prompt(name: "Configured", content: "Summarize.")
+        promptRepo.prompts = [prompt]
+        llm.streamTokens = ["Done"]
+        llm.streamDelayNs = 100_000_000
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo,
+            configStore: configStore
+        )
+
+        let generationID = try XCTUnwrap(
+            viewModel.generatePromptResult(transcript: "Transcript", transcriptionId: UUID())
+        )
+        XCTAssertEqual(
+            viewModel.pendingGeneration(id: generationID)?.modelSnapshot,
+            "model-before-enqueue"
+        )
+
+        configStore.config = .openai(apiKey: "test", model: "model-after-enqueue")
+        viewModel.refreshModelInfo()
+        try await waitUntil { self.promptResultRepo.saveCalls.count == 1 }
+
+        XCTAssertEqual(llm.lastSummaryModelOverride, "model-before-enqueue")
+    }
+
+    func testStreamWithoutTerminalDoesNotPersistResult() async throws {
+        let prompt = Prompt(
+            name: "Configured",
+            content: "Summarize.",
+            inferenceSettings: PromptInferenceSettings(maxTokens: 200)
+        )
+        promptRepo.prompts = [prompt]
+        llm.streamTokens = ["Partial output"]
+        llm.streamEmitsTerminal = false
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo
+        )
+
+        let generationID = try XCTUnwrap(
+            viewModel.generatePromptResult(transcript: "Transcript", transcriptionId: UUID())
+        )
+        try await waitUntil {
+            guard let generation = self.viewModel.pendingGeneration(id: generationID) else { return false }
+            if case .failed = generation.state { return true }
+            return false
+        }
+
+        XCTAssertTrue(promptResultRepo.saveCalls.isEmpty)
+        XCTAssertEqual(viewModel.pendingGeneration(id: generationID)?.content, "Partial output")
+    }
+
+    func testRegenerateReusesPersistedEffectiveSettingsAsRequestedSnapshot() async throws {
+        let promptID = UUID()
+        let versionID = UUID()
+        let effective = PromptInferenceSettings(topP: 0.7, maxTokens: 600)
+        let existing = PromptResult(
+            transcriptionId: UUID(),
+            promptId: promptID,
+            promptVersionId: versionID,
+            promptName: "Configured",
+            promptContent: "Summarize.",
+            content: "Old",
+            inferenceSettingsSnapshot: effective,
+            providerSnapshot: "openai",
+            modelSnapshot: "historical-model"
+        )
+        llm.streamEmitsTerminal = false
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo
+        )
+
+        let generationID = try XCTUnwrap(
+            viewModel.regeneratePromptResult(existing, transcript: "Transcript")
+        )
+
+        try await waitUntil {
+            guard let generation = self.viewModel.pendingGeneration(id: generationID) else { return false }
+            if case .failed = generation.state { return true }
+            return false
+        }
+        XCTAssertEqual(viewModel.pendingGeneration(id: generationID)?.inferenceSettings, effective)
+        XCTAssertEqual(viewModel.pendingGeneration(id: generationID)?.promptId, promptID)
+        XCTAssertEqual(viewModel.pendingGeneration(id: generationID)?.promptVersionId, versionID)
+        XCTAssertEqual(viewModel.pendingGeneration(id: generationID)?.modelSnapshot, "historical-model")
+        XCTAssertEqual(llm.lastSummaryModelOverride, "historical-model")
+    }
+
+    func testGeneratePromptResultRefreshesMaterializedMeetingMarkdown() async throws {
+        let folderURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PromptResultsViewModelTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: folderURL) }
+        try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
+        try Data("audio".utf8).write(to: folderURL.appendingPathComponent("meeting-playback.m4a"))
+
+        let transcriptionID = UUID()
+        let transcription = Transcription(
+            id: transcriptionID,
+            fileName: "Design Review",
+            filePath: folderURL.appendingPathComponent("meeting-playback.m4a").path,
+            rawTranscript: "Alice will send the draft tomorrow.",
+            status: .completed,
+            sourceType: .meeting,
+            userNotes: "Decision: ship"
+        )
+        try transcriptionRepo.save(transcription)
+
+        let prompt = Prompt(
+            name: "Action Items",
+            content: "Extract action items only.",
+            category: .result,
+            isBuiltIn: false,
+            sortOrder: 99
+        )
+        promptRepo.prompts = [prompt]
+
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo,
+            transcriptionRepo: transcriptionRepo,
+            meetingArtifactStore: MeetingArtifactStore()
+        )
+        viewModel.selectedPrompt = prompt
+        llm.streamTokens = ["Task ", "one"]
+
+        viewModel.generatePromptResult(
+            transcript: "Alice will send the draft tomorrow.",
+            transcriptionId: transcriptionID
+        )
+
+        let markdownURL = folderURL.appendingPathComponent(MeetingArtifactStore.markdownFileName)
+        try await waitUntil {
+            (try? String(contentsOf: markdownURL, encoding: .utf8))
+                .map { $0.contains("promptResultCount: 1") && $0.contains("## Prompt Results") }
+                ?? false
+        }
+
+        let markdown = try String(contentsOf: markdownURL, encoding: .utf8)
+        XCTAssertTrue(markdown.contains("promptResultCount: 1"))
+        XCTAssertTrue(markdown.contains("## Prompt Results"))
+        XCTAssertTrue(markdown.contains("- 1. Action Items"))
+
+        let promptResults = try promptResultRepo.fetchAll(transcriptionId: transcriptionID)
+        let resultMarkdownURL = try XCTUnwrap(
+            MeetingMarkdownArtifactPaths.resolve(
+                transcription: transcription,
+                promptResults: promptResults
+            ).promptResultFiles.first?.path.map(URL.init(fileURLWithPath:))
+        )
+        let resultMarkdown = try String(contentsOf: resultMarkdownURL, encoding: .utf8)
+        XCTAssertTrue(resultMarkdown.contains("Task one"))
+
+        let expectedMarkdown = MeetingMarkdownRenderer().render(
+            transcription: transcription,
+            promptResults: promptResults,
+            artifactPaths: MeetingMarkdownArtifactPaths.resolve(
+                transcription: transcription,
+                promptResults: promptResults
+            )
+        )
+        XCTAssertEqual(markdown, expectedMarkdown)
+    }
+
+    func testGeneratePromptResultDoesNotPersistEmptyStream() async throws {
+        let transcriptionID = UUID()
+        let prompt = Prompt(
+            name: "Action Items",
+            content: "Extract action items only.",
+            category: .result,
+            isBuiltIn: false,
+            sortOrder: 99
+        )
+        promptRepo.prompts.append(prompt)
+
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo
+        )
+        viewModel.selectedPrompt = prompt
+        llm.streamTokens = []
+
+        viewModel.generatePromptResult(
+            transcript: "Alice will send the draft tomorrow.",
+            transcriptionId: transcriptionID
+        )
+
+        try await Task.sleep(for: .milliseconds(200))
+
+        XCTAssertTrue(promptResultRepo.saveCalls.isEmpty)
+        XCTAssertTrue(viewModel.promptResults.isEmpty)
+        // The failed generation stays visible so its tab can show the error
+        // with Retry/Dismiss instead of silently disappearing (#478).
+        XCTAssertEqual(viewModel.pendingGenerations.count, 1)
+        guard case .failed(let message) = viewModel.pendingGenerations.first?.state else {
+            return XCTFail("Expected generation to be marked failed")
+        }
+        XCTAssertTrue(message.contains("empty response"))
+        XCTAssertFalse(viewModel.hasActiveGenerations)
+        XCTAssertTrue(viewModel.hasPendingGenerations)
+        XCTAssertTrue(viewModel.errorMessage?.contains("empty response") == true)
+    }
+
+    func testSuccessfulQueuedGenerationClearsEarlierEmptyStreamError() async throws {
+        let transcriptionID = UUID()
+        let firstPrompt = Prompt(
+            name: "Action Items",
+            content: "Extract action items only.",
+            category: .result,
+            isBuiltIn: false,
+            sortOrder: 99
+        )
+        let secondPrompt = Prompt(
+            name: "Decisions",
+            content: "Extract decisions only.",
+            category: .result,
+            isBuiltIn: false,
+            sortOrder: 100
+        )
+        promptRepo.prompts.append(contentsOf: [firstPrompt, secondPrompt])
+
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo
+        )
+        llm.streamTokenBatches = [[], ["Recovered"]]
+
+        viewModel.selectedPrompt = firstPrompt
+        viewModel.generatePromptResult(transcript: "Transcript", transcriptionId: transcriptionID)
+        viewModel.selectedPrompt = secondPrompt
+        viewModel.generatePromptResult(transcript: "Transcript", transcriptionId: transcriptionID)
+
+        try await Task.sleep(for: .milliseconds(300))
+
+        XCTAssertEqual(promptResultRepo.saveCalls.count, 1)
+        XCTAssertEqual(promptResultRepo.saveCalls.first?.promptName, "Decisions")
+        XCTAssertEqual(promptResultRepo.saveCalls.first?.content, "Recovered")
+        XCTAssertNil(viewModel.errorMessage)
+        // The first generation's failure must not block the queued second
+        // one, and it remains visible as a failed entry afterwards.
+        XCTAssertEqual(viewModel.pendingGenerations.count, 1)
+        XCTAssertEqual(viewModel.pendingGenerations.first?.promptName, "Action Items")
+        XCTAssertFalse(viewModel.hasActiveGenerations)
+    }
+
+    func testUnreadPromptResultsTrackMultipleCompletedResults() async throws {
+        let transcriptionID = UUID()
+        let secondPrompt = Prompt(
+            name: "Action Items",
+            content: "Extract action items only.",
+            category: .result,
+            isBuiltIn: false,
+            sortOrder: 99
+        )
+        promptRepo.prompts.append(secondPrompt)
+
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo
+        )
+        viewModel.shouldMarkPromptResultUnread = { _ in true }
+        llm.streamTokens = ["Done"]
+
+        _ = viewModel.generatePromptResult(transcript: "Transcript", transcriptionId: transcriptionID)
+        viewModel.selectedPrompt = secondPrompt
+        _ = viewModel.generatePromptResult(transcript: "Transcript", transcriptionId: transcriptionID)
+
+        try await Task.sleep(for: .milliseconds(300))
+
+        let ids = Set(viewModel.promptResults.map(\.id))
+        XCTAssertEqual(viewModel.unreadPromptResultIDs, ids)
+
+        let firstID = try XCTUnwrap(viewModel.promptResults.last?.id)
+        viewModel.markPromptResultViewed(firstID)
+
+        XCTAssertFalse(viewModel.hasUnreadPromptResult(firstID))
+        XCTAssertEqual(viewModel.unreadPromptResultIDs.count, 1)
+    }
+
+    func testGeneratePromptResultRequiresSelectedVisiblePrompt() {
+        for index in promptRepo.prompts.indices {
+            promptRepo.prompts[index].isVisible = false
+            promptRepo.prompts[index].isAutoRun = false
+        }
+
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo
+        )
+
+        XCTAssertTrue(viewModel.canGeneratePromptResult)
+        XCTAssertFalse(viewModel.canGenerateManualPromptResult)
+        XCTAssertTrue(viewModel.visiblePrompts.isEmpty)
+        XCTAssertNil(viewModel.selectedPrompt)
+        XCTAssertNil(viewModel.generatePromptResult(transcript: "Transcript", transcriptionId: UUID()))
+        XCTAssertEqual(llm.summarizeCallCount, 0)
+    }
+
+    func testRegeneratePromptResultReplacesExistingResult() async throws {
+        let transcriptionID = UUID()
+        let existing = PromptResult(
+            transcriptionId: transcriptionID,
+            promptName: "General Summary",
+            promptContent: Prompt.defaultPrompt.content,
+            content: "Old summary"
+        )
+        promptResultRepo.promptResults = [existing]
+
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo
+        )
+        viewModel.loadPromptResults(transcriptionId: transcriptionID)
+        llm.streamTokens = ["New ", "summary"]
+
+        let generationID = viewModel.regeneratePromptResult(existing, transcript: "Transcript")
+
+        try await Task.sleep(for: .milliseconds(200))
+
+        XCTAssertEqual(promptResultRepo.replaceCalls.count, 1)
+        XCTAssertEqual(promptResultRepo.replaceCalls[0].deletingExistingID, existing.id)
+        XCTAssertEqual(promptResultRepo.promptResults.count, 1)
+        XCTAssertEqual(promptResultRepo.promptResults.first?.content, "New summary")
+        XCTAssertEqual(viewModel.promptResults.first?.content, "New summary")
+        XCTAssertEqual(viewModel.promptResults.first?.id, generationID)
+    }
+
+    func testRegenerateEmptyStreamKeepsExistingResultAndMarksGenerationFailed() async throws {
+        let transcriptionID = UUID()
+        let existing = PromptResult(
+            transcriptionId: transcriptionID,
+            promptName: "General Summary",
+            promptContent: Prompt.defaultPrompt.content,
+            content: "Old summary"
+        )
+        promptResultRepo.promptResults = [existing]
+
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo
+        )
+        viewModel.loadPromptResults(transcriptionId: transcriptionID)
+        llm.streamTokens = []
+
+        let generationID = try XCTUnwrap(viewModel.regeneratePromptResult(existing, transcript: "Transcript"))
+
+        try await Task.sleep(for: .milliseconds(200))
+
+        XCTAssertTrue(promptResultRepo.replaceCalls.isEmpty)
+        XCTAssertEqual(promptResultRepo.promptResults.count, 1)
+        XCTAssertEqual(promptResultRepo.promptResults.first?.id, existing.id)
+        XCTAssertEqual(promptResultRepo.promptResults.first?.content, "Old summary")
+        XCTAssertEqual(viewModel.promptResults.count, 1)
+        XCTAssertEqual(viewModel.promptResults.first?.id, existing.id)
+        XCTAssertEqual(viewModel.promptResults.first?.content, "Old summary")
+        let failed = try XCTUnwrap(viewModel.pendingGeneration(id: generationID))
+        guard case .failed(let message) = failed.state else {
+            return XCTFail("Expected regeneration to be marked failed")
+        }
+        XCTAssertTrue(message.contains("empty response"))
+        XCTAssertEqual(failed.replacingPromptResultID, existing.id)
+        XCTAssertTrue(viewModel.errorMessage?.contains("empty response") == true)
+    }
+
+    func testStreamErrorMarksGenerationFailedWithProviderMessage() async throws {
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo
+        )
+        llm.errorToThrow = LLMError.cliError(
+            "Timed out after 45s. Verify the command runs successfully in a terminal and is logged in if required."
+        )
+
+        let generationID = try XCTUnwrap(
+            viewModel.generatePromptResult(transcript: "Transcript", transcriptionId: UUID())
+        )
+
+        try await Task.sleep(for: .milliseconds(200))
+
+        let failed = try XCTUnwrap(viewModel.pendingGeneration(id: generationID))
+        guard case .failed(let message) = failed.state else {
+            return XCTFail("Expected generation to be marked failed")
+        }
+        XCTAssertTrue(message.contains("Timed out after 45s"))
+        XCTAssertTrue(promptResultRepo.saveCalls.isEmpty)
+    }
+
+    func testRetryGenerationReEnqueuesFailedGenerationWithSameInputs() async throws {
+        let transcriptionID = UUID()
+        let promptID = UUID()
+        let versionID = UUID()
+        let existing = PromptResult(
+            transcriptionId: transcriptionID,
+            promptId: promptID,
+            promptVersionId: versionID,
+            promptName: "General Summary",
+            promptContent: Prompt.defaultPrompt.content,
+            content: "Old summary",
+            providerSnapshot: "openai",
+            modelSnapshot: "historical-model"
+        )
+        promptResultRepo.promptResults = [existing]
+
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo
+        )
+        viewModel.loadPromptResults(transcriptionId: transcriptionID)
+        llm.streamTokenBatches = [[], ["Recovered"]]
+
+        let failedID = try XCTUnwrap(viewModel.regeneratePromptResult(existing, transcript: "Transcript"))
+        try await Task.sleep(for: .milliseconds(200))
+        guard case .failed = viewModel.pendingGeneration(id: failedID)?.state else {
+            return XCTFail("Expected first attempt to fail")
+        }
+        XCTAssertEqual(viewModel.pendingGeneration(id: failedID)?.promptId, promptID)
+        XCTAssertEqual(viewModel.pendingGeneration(id: failedID)?.promptVersionId, versionID)
+        XCTAssertEqual(viewModel.pendingGeneration(id: failedID)?.modelSnapshot, "historical-model")
+
+        let retriedID = try XCTUnwrap(viewModel.retryGeneration(id: failedID))
+        XCTAssertNotEqual(retriedID, failedID)
+        XCTAssertNil(viewModel.pendingGeneration(id: failedID))
+
+        try await Task.sleep(for: .milliseconds(200))
+
+        XCTAssertTrue(viewModel.pendingGenerations.isEmpty)
+        XCTAssertEqual(promptResultRepo.replaceCalls.count, 1)
+        XCTAssertEqual(promptResultRepo.replaceCalls[0].deletingExistingID, existing.id)
+        XCTAssertEqual(viewModel.promptResults.first?.content, "Recovered")
+        XCTAssertEqual(viewModel.promptResults.first?.promptId, promptID)
+        XCTAssertEqual(viewModel.promptResults.first?.promptVersionId, versionID)
+        XCTAssertEqual(llm.lastSummaryModelOverride, "historical-model")
+        XCTAssertNil(viewModel.errorMessage)
+    }
+
+    func testRetryGenerationKeepsFailedEntryWhenLLMServiceIsGone() async throws {
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo
+        )
+        llm.streamTokens = []
+
+        let generationID = try XCTUnwrap(
+            viewModel.generatePromptResult(transcript: "Transcript", transcriptionId: UUID())
+        )
+        try await Task.sleep(for: .milliseconds(200))
+        guard case .failed = viewModel.pendingGeneration(id: generationID)?.state else {
+            return XCTFail("Expected generation to be marked failed")
+        }
+
+        viewModel.configure(
+            llmService: nil,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo
+        )
+
+        // Retry can't start without a service — the failed card (and its
+        // error message) must survive instead of being silently removed.
+        XCTAssertNil(viewModel.retryGeneration(id: generationID))
+        XCTAssertNotNil(viewModel.pendingGeneration(id: generationID))
+    }
+
+    func testRetryGenerationIgnoresActiveGenerations() throws {
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo
+        )
+        llm.streamDelayNs = 1_000_000_000
+
+        let generationID = try XCTUnwrap(
+            viewModel.generatePromptResult(transcript: "Transcript", transcriptionId: UUID())
+        )
+
+        XCTAssertNil(viewModel.retryGeneration(id: generationID))
+        XCTAssertEqual(viewModel.pendingGenerations.count, 1)
+    }
+
+    func testCancelGenerationRemovesFailedGeneration() async throws {
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo
+        )
+        llm.streamTokens = []
+
+        let generationID = try XCTUnwrap(
+            viewModel.generatePromptResult(transcript: "Transcript", transcriptionId: UUID())
+        )
+        try await Task.sleep(for: .milliseconds(200))
+        guard case .failed = viewModel.pendingGeneration(id: generationID)?.state else {
+            return XCTFail("Expected generation to be marked failed")
+        }
+
+        viewModel.cancelGeneration(id: generationID)
+
+        XCTAssertTrue(viewModel.pendingGenerations.isEmpty)
+    }
+
+    func testDeletePromptResultRemovesResultAndKeepsRemainingPromptResults() throws {
+        let transcriptionID = UUID()
+        let older = PromptResult(
+            transcriptionId: transcriptionID,
+            promptName: "General Summary",
+            promptContent: Prompt.defaultPrompt.content,
+            content: "Older",
+            createdAt: Date(timeIntervalSince1970: 10),
+            updatedAt: Date(timeIntervalSince1970: 10)
+        )
+        let newer = PromptResult(
+            transcriptionId: transcriptionID,
+            promptName: "Action Items",
+            promptContent: "Extract action items only.",
+            content: "Newer",
+            createdAt: Date(timeIntervalSince1970: 20),
+            updatedAt: Date(timeIntervalSince1970: 20)
+        )
+        promptResultRepo.promptResults = [older, newer]
+
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo
+        )
+        viewModel.loadPromptResults(transcriptionId: transcriptionID)
+
+        viewModel.deletePromptResult(newer)
+
+        XCTAssertEqual(promptResultRepo.deleteCalls, [newer.id])
+        XCTAssertEqual(viewModel.promptResults.map(\.content), ["Older"])
+    }
+
+    func testAutoGeneratePromptResultsRunsForShortNonEmptyTranscript() {
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo
+        )
+
+        let queuedIDs = viewModel.autoGeneratePromptResults(
+            transcript: "brief but important",
+            transcriptionId: UUID(),
+            sourceType: .meeting
+        )
+
+        XCTAssertFalse(queuedIDs.isEmpty)
+        XCTAssertEqual(viewModel.pendingGenerations.map(\.id), queuedIDs)
+        XCTAssertEqual(viewModel.pendingGenerations.first?.transcript, "brief but important")
+    }
+
+    func testAutoGeneratePromptResultsSkipsEmptyAndWhitespaceOnlyTranscript() {
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo
+        )
+
+        for transcript in ["", "   \n\t  "] {
+            let queuedIDs = viewModel.autoGeneratePromptResults(
+                transcript: transcript,
+                transcriptionId: UUID(),
+                sourceType: .meeting
+            )
+
+            XCTAssertTrue(queuedIDs.isEmpty)
+            XCTAssertTrue(viewModel.pendingGenerations.isEmpty)
+        }
+    }
+
+    func testLoadPromptResultsClearsPendingGenerationsWhenSwitchingTranscriptions() {
+        let firstTranscriptionID = UUID()
+        let secondTranscriptionID = UUID()
+        llm.streamDelayNs = 1_000_000_000
+
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo
+        )
+
+        let transcript = String(repeating: "Long transcript ", count: 50)
+        _ = viewModel.generatePromptResult(transcript: transcript, transcriptionId: firstTranscriptionID)
+        _ = viewModel.generatePromptResult(transcript: transcript, transcriptionId: firstTranscriptionID)
+
+        XCTAssertEqual(viewModel.pendingGenerations.count, 2)
+        XCTAssertTrue(viewModel.hasPendingGenerations)
+
+        viewModel.loadPromptResults(transcriptionId: secondTranscriptionID)
+
+        XCTAssertTrue(viewModel.pendingGenerations.isEmpty)
+        XCTAssertFalse(viewModel.hasPendingGenerations)
+        XCTAssertEqual(viewModel.queuedGenerationCount, 0)
+        XCTAssertNil(viewModel.streamingPromptResultID)
+    }
+
+    func testNavigationCancelsManualWorkButPreservesQueuedBackgroundMeetingPrompts() async throws {
+        let manualID = UUID()
+        let firstMeetingID = UUID()
+        let secondMeetingID = UUID()
+        let displayedID = UUID()
+        let displayedResult = PromptResult(
+            transcriptionId: displayedID,
+            promptName: "Summary",
+            promptContent: "Summarize",
+            content: "Displayed result"
+        )
+        promptResultRepo.promptResults = [displayedResult]
+        promptRepo.prompts = [
+            Prompt(name: "Summary", content: "Summarize", isAutoRun: true, sortOrder: 0)
+        ]
+        llm.streamDelayNs = 10_000_000
+        llm.streamTokens = ["Completed result"]
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo
+        )
+        _ = viewModel.generatePromptResult(transcript: "Manual work", transcriptionId: manualID)
+        _ = viewModel.autoGeneratePromptResults(
+            transcript: "First background meeting",
+            transcriptionId: firstMeetingID,
+            sourceType: .meeting,
+            runInBackground: true
+        )
+        _ = viewModel.autoGeneratePromptResults(
+            transcript: "Second background meeting",
+            transcriptionId: secondMeetingID,
+            sourceType: .meeting,
+            runInBackground: true
+        )
+
+        viewModel.loadPromptResults(transcriptionId: displayedID)
+        try await waitUntil { !viewModel.pendingGenerations.contains { $0.state.isActive } }
+
+        XCTAssertTrue(try promptResultRepo.fetchAll(transcriptionId: manualID).isEmpty)
+        XCTAssertEqual(
+            try promptResultRepo.fetchAll(transcriptionId: firstMeetingID).map(\.content),
+            ["Completed result"]
+        )
+        XCTAssertEqual(
+            try promptResultRepo.fetchAll(transcriptionId: secondMeetingID).map(\.content),
+            ["Completed result"]
+        )
+        XCTAssertEqual(viewModel.promptResults.map(\.id), [displayedResult.id])
+    }
+
+    func testBackgroundMeetingStatusDoesNotLeakIntoDisplayedTranscriptControls() async throws {
+        let backgroundID = UUID()
+        let displayedID = UUID()
+        let configStore = MockLLMConfigStore()
+        configStore.config = .ollama(model: "initial-model")
+        promptRepo.prompts = [
+            Prompt(name: "Summary", content: "Summarize", isAutoRun: true, sortOrder: 0)
+        ]
+        llm.streamTokens = ["Saved result"]
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo,
+            configStore: configStore
+        )
+        viewModel.loadPromptResults(transcriptionId: displayedID)
+        _ = viewModel.autoGeneratePromptResults(
+            transcript: "Background A",
+            transcriptionId: backgroundID,
+            sourceType: .meeting,
+            runInBackground: true
+        )
+        _ = viewModel.autoGeneratePromptResults(
+            transcript: "Another background meeting",
+            transcriptionId: UUID(),
+            sourceType: .meeting,
+            runInBackground: true
+        )
+
+        XCTAssertFalse(viewModel.hasPendingGenerations)
+        XCTAssertFalse(viewModel.hasActiveGenerations)
+        XCTAssertFalse(viewModel.isStreaming)
+        XCTAssertEqual(viewModel.queuedGenerationCount, 0)
+        XCTAssertNil(viewModel.streamingPromptResultID)
+        XCTAssertEqual(viewModel.streamingPromptName, "")
+        XCTAssertEqual(viewModel.streamingContent, "")
+        XCTAssertTrue(viewModel.canGenerateManualPromptResult)
+        // The globally shared model remains explicitly unavailable in both
+        // the picker and mutation API while any meeting still owns work.
+        XCTAssertFalse(viewModel.canSelectModel)
+        viewModel.selectModel("changed-model")
+        XCTAssertEqual(viewModel.currentModelName, "initial-model")
+        viewModel.cancelStreaming()  // No visible stream: must not cancel A.
+
+        let manualID = try XCTUnwrap(
+            viewModel.generatePromptResult(transcript: "Displayed B", transcriptionId: displayedID)
+        )
+        XCTAssertTrue(viewModel.hasActiveGenerations)
+        XCTAssertEqual(viewModel.queuedGenerationCount, 1)
+        XCTAssertFalse(viewModel.isStreaming)
+        try await waitUntil { !viewModel.pendingGenerations.contains { $0.state.isActive } }
+
+        XCTAssertEqual(
+            try promptResultRepo.fetchAll(transcriptionId: backgroundID).map(\.content),
+            ["Saved result"]
+        )
+        XCTAssertEqual(viewModel.promptResults.map(\.id), [manualID])
+        XCTAssertTrue(viewModel.canSelectModel)
+        viewModel.selectModel("changed-model")
+        XCTAssertEqual(viewModel.currentModelName, "changed-model")
+    }
+
+    func testBackgroundPromptFailureDoesNotReplaceDisplayedMeetingError() async throws {
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo
+        )
+        viewModel.loadPromptResults(transcriptionId: UUID())
+        let displayedError = "An error belonging to the displayed meeting"
+        viewModel.errorMessage = displayedError
+        llm.streamTokens = []
+        let generationIDs = viewModel.autoGeneratePromptResults(
+            transcript: "Background meeting",
+            transcriptionId: UUID(),
+            sourceType: .meeting,
+            runInBackground: true
+        )
+        let generationID = try XCTUnwrap(generationIDs.first)
+        XCTAssertEqual(viewModel.errorMessage, displayedError)
+        // Navigation must preserve already-streaming background work as well
+        // as queued work, and its eventual error stays on its own meeting.
+        viewModel.loadPromptResults(transcriptionId: UUID())
+        viewModel.errorMessage = displayedError
+        try await waitUntil { !viewModel.pendingGenerations.contains { $0.state.isActive } }
+
+        guard case .failed = viewModel.pendingGeneration(id: generationID)?.state else {
+            return XCTFail("The background failure must remain retryable on its meeting")
+        }
+        XCTAssertEqual(viewModel.errorMessage, displayedError)
+    }
+
+    func testBackgroundPromptRetryPreservesNotesSnapshotAndDisplayedMeeting() async throws {
+        let meetingID = UUID()
+        let promptID = UUID()
+        let versionID = UUID()
+        let labelID = UUID()
+        var meeting = Transcription(
+            id: meetingID,
+            fileName: "Background meeting",
+            sourceType: .meeting,
+            userNotes: "Original decision"
+        )
+        try transcriptionRepo.save(meeting)
+        promptRepo.prompts = [
+            Prompt(
+                id: promptID, name: "Summary", content: "Summarize", isAutoRun: true,
+                includeMeetingNotes: true, activeVersionId: versionID,
+                modelOverride: "queued-model"
+            )
+        ]
+        let displayedID = UUID()
+        let displayedResult = PromptResult(
+            transcriptionId: displayedID, promptName: "Summary",
+            promptContent: "Summarize", content: "Displayed result"
+        )
+        promptResultRepo.promptResults = [displayedResult]
+        let policies = PromptLabelPolicyRepositoryMock()
+        policies.policiesByPromptID[promptID] = [
+            PromptLabelPolicy(promptId: promptID, scopeKind: .all, isAvailable: false),
+            PromptLabelPolicy(promptId: promptID, scopeKind: .label, labelId: labelID, isAvailable: true),
+        ]
+        let labels = TranscriptionLabelRepositoryMock()
+        labels.labelIDsByTranscriptionID[meetingID] = [labelID]
+        viewModel.configure(
+            llmService: llm, promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo,
+            promptLabelPolicyRepository: policies,
+            transcriptionLabelRepository: labels,
+            transcriptionRepo: transcriptionRepo
+        )
+        viewModel.loadPromptResults(transcriptionId: displayedID)
+        llm.streamTokens = []
+        let generationID = try XCTUnwrap(
+            viewModel.autoGeneratePromptResults(
+                transcript: "Background transcript", transcriptionId: meetingID,
+                sourceType: .meeting, runInBackground: true
+            ).first)
+        try await waitUntil { !self.viewModel.pendingGenerations.contains { $0.state.isActive } }
+        guard case .failed = viewModel.pendingGeneration(id: generationID)?.state else {
+            return XCTFail("Expected the empty response to fail")
+        }
+
+        // Retry must keep the failed request, even after the live prompt changes.
+        promptRepo.prompts[0].activeVersionId = UUID()
+        promptRepo.prompts[0].content = "Edited after failure"
+        promptRepo.prompts[0].modelOverride = "new-model"
+        meeting.userNotes = "Changed after failure"
+        try transcriptionRepo.save(meeting)
+        llm.streamTokens = ["Retried result"]
+        XCTAssertNotNil(viewModel.retryGeneration(id: generationID))
+        try await waitUntil { self.promptResultRepo.saveCalls.count == 1 }
+
+        let result = try XCTUnwrap(promptResultRepo.saveCalls.first)
+        XCTAssertEqual(result.transcriptionId, meetingID)
+        XCTAssertEqual(result.promptId, promptID)
+        XCTAssertEqual(result.promptVersionId, versionID)
+        XCTAssertEqual(result.promptContent, "Summarize")
+        XCTAssertEqual(llm.lastSummaryModelOverride, "queued-model")
+        XCTAssertEqual(result.userNotesSnapshot, "Original decision")
+        XCTAssertTrue(result.includeMeetingNotesSnapshot)
+        XCTAssertTrue(try XCTUnwrap(llm.lastSummarySystemPrompt).contains("Original decision"))
+        XCTAssertFalse(try XCTUnwrap(llm.lastSummarySystemPrompt).contains("Changed after failure"))
+        XCTAssertEqual(viewModel.promptResults.map(\.id), [displayedResult.id])
+    }
+
+    func testLoadPromptResultsClearsFailedGenerationsWhenSwitchingTranscriptions() async throws {
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo
+        )
+        llm.streamTokens = []
+
+        let generationID = try XCTUnwrap(
+            viewModel.generatePromptResult(transcript: "Transcript", transcriptionId: UUID())
+        )
+        try await Task.sleep(for: .milliseconds(200))
+        guard case .failed = viewModel.pendingGeneration(id: generationID)?.state else {
+            return XCTFail("Expected generation to be marked failed")
+        }
+
+        // Failure feedback is scoped to the visit, like every other pending
+        // generation: navigating to another transcription drops it rather
+        // than resurfacing a stale error on the next visit.
+        viewModel.loadPromptResults(transcriptionId: UUID())
+
+        XCTAssertTrue(viewModel.pendingGenerations.isEmpty)
+    }
+
+    func testAutoGeneratePromptResultsDoesNothingWhenNoAutoRunPromptsAreEnabled() {
+        for index in promptRepo.prompts.indices {
+            promptRepo.prompts[index].isAutoRun = false
+        }
+
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo
+        )
+
+        let queuedIDs = viewModel.autoGeneratePromptResults(
+            transcript: String(repeating: "Long transcript ", count: 50),
+            transcriptionId: UUID(),
+            sourceType: .meeting
+        )
+
+        XCTAssertTrue(queuedIDs.isEmpty)
+        XCTAssertTrue(viewModel.pendingGenerations.isEmpty)
+        XCTAssertEqual(llm.summarizeCallCount, 0)
+    }
+
+    func testAutoGeneratePromptResultsAlsoQueuesKnowledgeCardWhenProviderIsConfigured() async {
+        for index in promptRepo.prompts.indices {
+            promptRepo.prompts[index].isAutoRun = false
+        }
+        let cardGenerator = RecordingCardGenerator()
+        let transcriptionID = UUID()
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo,
+            cardGenerator: cardGenerator
+        )
+
+        let queuedIDs = viewModel.autoGeneratePromptResults(
+            transcript: "A completed meeting transcript.",
+            transcriptionId: transcriptionID,
+            sourceType: .meeting
+        )
+
+        XCTAssertTrue(queuedIDs.isEmpty)
+        var generatedIDs: [UUID] = []
+        for _ in 0..<20 {
+            generatedIDs = await cardGenerator.transcriptionIDs
+            if !generatedIDs.isEmpty { break }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(generatedIDs, [transcriptionID])
+    }
+
+    func testAutoGeneratePromptResultsRespectsSourceScoping() {
+        // One unscoped (all sources) + one meeting-only auto-run prompt.
+        promptRepo.prompts = [
+            Prompt(name: "Summary", content: "c", category: .result, isVisible: true, isAutoRun: true, sortOrder: 0),
+            Prompt(
+                name: "Action Items", content: "c", category: .result, isVisible: true, isAutoRun: true, sortOrder: 1,
+                appliesToSources: [.meeting]),
+        ]
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo
+        )
+
+        let transcript = String(repeating: "Long transcript ", count: 50)
+
+        let youtubeIDs = viewModel.autoGeneratePromptResults(
+            transcript: transcript,
+            transcriptionId: UUID(),
+            sourceType: .youtube
+        )
+        XCTAssertEqual(youtubeIDs.count, 1, "Meeting-only prompt must not auto-run on a YouTube transcription.")
+
+        let meetingIDs = viewModel.autoGeneratePromptResults(
+            transcript: transcript,
+            transcriptionId: UUID(),
+            sourceType: .meeting
+        )
+        XCTAssertEqual(meetingIDs.count, 2, "Both the unscoped and meeting-scoped prompts auto-run after a meeting.")
+    }
+
+    func testMeetingPoliciesDriveAutoRunWithExactPrecedenceAndEffectiveOrdering() {
+        let meetingTypeID = UUID()
+        let excluded = Prompt(
+            name: "Excluded by exact policy",
+            content: "excluded",
+            category: .result,
+            isVisible: true,
+            isAutoRun: true,
+            sortOrder: 0
+        )
+        let exact = Prompt(
+            name: "Exact policy",
+            content: "exact",
+            category: .result,
+            isVisible: true,
+            isAutoRun: false,
+            sortOrder: 100
+        )
+        let fallback = Prompt(
+            name: "All meetings fallback",
+            content: "fallback",
+            category: .result,
+            isVisible: true,
+            isAutoRun: false,
+            sortOrder: 1
+        )
+        promptRepo.prompts = [excluded, exact, fallback]
+        let policies = MockPromptMeetingPolicyRepository()
+        policies.policiesByPromptID = [
+            excluded.id: [
+                .allMeetings(promptId: excluded.id, isAvailable: true, isAutoRun: true),
+                .meetingType(
+                    promptId: excluded.id,
+                    meetingTypeId: meetingTypeID,
+                    isAvailable: false,
+                    isAutoRun: false
+                ),
+            ],
+            exact.id: [
+                .allMeetings(promptId: exact.id, isAvailable: false, isAutoRun: false),
+                .meetingType(
+                    promptId: exact.id,
+                    meetingTypeId: meetingTypeID,
+                    isAvailable: true,
+                    isAutoRun: true,
+                    sortOrder: 5
+                ),
+            ],
+            fallback.id: [
+                .allMeetings(
+                    promptId: fallback.id,
+                    isAvailable: true,
+                    isAutoRun: true,
+                    sortOrder: 10
+                )
+            ],
+        ]
+        llm.streamDelayNs = 1_000_000_000
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo,
+            promptMeetingPolicyRepository: policies
+        )
+
+        _ = viewModel.autoGeneratePromptResults(
+            transcript: "Meeting transcript",
+            transcriptionId: UUID(),
+            sourceType: .meeting,
+            meetingTypeId: meetingTypeID
+        )
+
+        XCTAssertEqual(viewModel.pendingGenerations.map(\.promptName), [exact.name, fallback.name])
+    }
+
+    func testMeetingPoliciesFilterAndOrderManualPromptPickerForCurrentMeetingType() throws {
+        let meetingTypeID = UUID()
+        let transcriptionID = UUID()
+        let unavailable = Prompt(name: "Unavailable", content: "u", category: .result, sortOrder: 0)
+        let later = Prompt(name: "Later", content: "l", category: .result, sortOrder: 1)
+        let first = Prompt(name: "First", content: "f", category: .result, sortOrder: 50)
+        promptRepo.prompts = [unavailable, later, first]
+        let policies = MockPromptMeetingPolicyRepository()
+        policies.policiesByPromptID = [
+            unavailable.id: [
+                .meetingType(
+                    promptId: unavailable.id,
+                    meetingTypeId: meetingTypeID,
+                    isAvailable: false,
+                    isAutoRun: false
+                )
+            ],
+            later.id: [
+                .allMeetings(promptId: later.id, isAvailable: true, isAutoRun: false, sortOrder: 20)
+            ],
+            first.id: [
+                .meetingType(
+                    promptId: first.id,
+                    meetingTypeId: meetingTypeID,
+                    isAvailable: true,
+                    isAutoRun: false,
+                    sortOrder: 10
+                )
+            ],
+        ]
+        try transcriptionRepo.save(
+            Transcription(
+                id: transcriptionID,
+                fileName: "meeting.m4a",
+                sourceType: .meeting,
+                meetingTypeId: meetingTypeID
+            ))
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo,
+            promptMeetingPolicyRepository: policies,
+            transcriptionRepo: transcriptionRepo
+        )
+
+        viewModel.loadPromptResults(transcriptionId: transcriptionID)
+
+        XCTAssertEqual(viewModel.visiblePrompts.map(\.name), [first.name, later.name])
+        XCTAssertEqual(viewModel.selectedPrompt?.id, first.id)
+
+        viewModel.loadVisiblePrompts(sourceType: .meeting, meetingTypeId: nil)
+
+        XCTAssertEqual(viewModel.visiblePrompts.map(\.name), [later.name])
+        XCTAssertEqual(viewModel.selectedPrompt?.id, later.id)
+    }
+
+    func testLabelPoliciesFilterPromptPickerForPodcast() throws {
+        let transcriptionID = UUID()
+        let customerLabelID = UUID()
+        let customerPrompt = Prompt(name: "Customer follow-up", content: "Draft follow-up", category: .result)
+        let generalPrompt = Prompt(name: "General summary", content: "Summarize", category: .result)
+        promptRepo.prompts = [customerPrompt, generalPrompt]
+        try transcriptionRepo.save(
+            Transcription(
+                id: transcriptionID,
+                fileName: "episode.mp3",
+                sourceType: .youtube
+            )
+        )
+        let policies = PromptLabelPolicyRepositoryMock()
+        policies.policiesByPromptID[customerPrompt.id] = [
+            PromptLabelPolicy(promptId: customerPrompt.id, scopeKind: .all, isAvailable: false),
+            PromptLabelPolicy(
+                promptId: customerPrompt.id,
+                scopeKind: .label,
+                labelId: customerLabelID,
+                isAvailable: true
+            ),
+        ]
+        let transcriptionLabels = TranscriptionLabelRepositoryMock()
+        transcriptionLabels.labelIDsByTranscriptionID[transcriptionID] = []
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo,
+            promptLabelPolicyRepository: policies,
+            transcriptionLabelRepository: transcriptionLabels,
+            transcriptionRepo: transcriptionRepo
+        )
+
+        viewModel.loadPromptResults(transcriptionId: transcriptionID)
+        XCTAssertEqual(viewModel.visiblePrompts.map(\.id), [generalPrompt.id])
+
+        transcriptionLabels.labelIDsByTranscriptionID[transcriptionID] = [customerLabelID]
+        viewModel.loadVisiblePrompts()
+        XCTAssertEqual(Set(viewModel.visiblePrompts.map(\.id)), [customerPrompt.id, generalPrompt.id])
+    }
+
+    func testAutoGeneratePromptResultsSkipsWhenAutoRunPromptFetchFails() {
+        promptRepo.fetchAutoRunPromptsError = PromptAutoRunFetchError()
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo
+        )
+
+        let queuedIDs = viewModel.autoGeneratePromptResults(
+            transcript: String(repeating: "Long transcript ", count: 50),
+            transcriptionId: UUID(),
+            sourceType: .meeting
+        )
+
+        XCTAssertTrue(queuedIDs.isEmpty)
+        XCTAssertTrue(viewModel.pendingGenerations.isEmpty)
+        XCTAssertEqual(llm.summarizeCallCount, 0)
+    }
+
+    // MARK: - ADR-020 §4–§6 — userNotes plumbing
+
+    func testGeneratePromptResultSubstitutesUserNotesIntoSystemPrompt() async throws {
+        let transcriptionID = UUID()
+        // Seed the transcription with the user's in-meeting notes so the VM
+        // picks them up via fetchUserNotes(for:).
+        try transcriptionRepo.save(
+            Transcription(
+                id: transcriptionID,
+                fileName: "meeting-playback.m4a",
+                sourceType: .meeting,
+                userNotes: "decision: ship Friday\nQA owns smoke tests"
+            )
+        )
+
+        // Custom prompt that exercises the {{userNotes}} substitution path.
+        // Named generically — the built-in "Memo-Steered Notes" prompt was
+        // reverted (ADR-020 2026-05-02 amendment) but the template renderer
+        // continues to support {{userNotes}} for custom prompts.
+        let notesAwarePrompt = Prompt(
+            name: "Notes-Aware Custom Prompt",
+            content: "Notes:\n{{userNotes}}\n---\nProduce structured output.",
+            category: .result,
+            isBuiltIn: false,
+            sortOrder: 0
+        )
+        promptRepo.prompts = [notesAwarePrompt]
+
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo,
+            transcriptionRepo: transcriptionRepo
+        )
+        viewModel.selectedPrompt = notesAwarePrompt
+        llm.streamTokens = ["done"]
+
+        viewModel.generatePromptResult(
+            transcript: "Some transcript",
+            transcriptionId: transcriptionID
+        )
+        try await Task.sleep(for: .milliseconds(200))
+
+        XCTAssertEqual(
+            llm.lastSummarySystemPrompt,
+            "Notes:\ndecision: ship Friday\nQA owns smoke tests\n---\nProduce structured output."
+        )
+    }
+
+    func testGeneratePromptResultSnapshotsUserNotesOntoSavedPromptResult() async throws {
+        let transcriptionID = UUID()
+        try transcriptionRepo.save(
+            Transcription(
+                id: transcriptionID,
+                fileName: "meeting-playback.m4a",
+                sourceType: .meeting,
+                userNotes: "snapshot me"
+            )
+        )
+
+        let prompt = Prompt(
+            name: "Memo",
+            content: "{{userNotes}}",
+            category: .result,
+            isBuiltIn: false,
+            sortOrder: 0
+        )
+        promptRepo.prompts = [prompt]
+
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo,
+            transcriptionRepo: transcriptionRepo
+        )
+        viewModel.selectedPrompt = prompt
+        llm.streamTokens = ["ok"]
+
+        viewModel.generatePromptResult(transcript: "transcript", transcriptionId: transcriptionID)
+        try await waitUntil { self.promptResultRepo.saveCalls.count == 1 }
+
+        XCTAssertEqual(promptResultRepo.saveCalls.first?.userNotesSnapshot, "snapshot me")
+        XCTAssertFalse(try XCTUnwrap(promptResultRepo.saveCalls.first).includeMeetingNotesSnapshot)
+    }
+
+    func testGeneratePromptResultOptInAppendsNotesAndPersistsEffectiveReceipt() async throws {
+        let transcriptionID = UUID()
+        try transcriptionRepo.save(
+            Transcription(
+                id: transcriptionID,
+                fileName: "meeting.m4a",
+                sourceType: .meeting,
+                userNotes: "Launch Friday"
+            )
+        )
+        let prompt = Prompt(
+            name: "Summary",
+            content: "Summarize.",
+            includeMeetingNotes: true
+        )
+        promptRepo.prompts = [prompt]
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo,
+            transcriptionRepo: transcriptionRepo
+        )
+        viewModel.selectedPrompt = prompt
+        llm.streamTokens = ["ok"]
+
+        viewModel.generatePromptResult(transcript: "transcript", transcriptionId: transcriptionID)
+        try await waitUntil { self.promptResultRepo.saveCalls.count == 1 }
+
+        XCTAssertTrue(
+            try XCTUnwrap(llm.lastSummarySystemPrompt).contains("<meeting_notes>\nLaunch Friday\n</meeting_notes>"))
+        XCTAssertEqual(promptResultRepo.saveCalls.first?.userNotesSnapshot, "Launch Friday")
+        XCTAssertTrue(try XCTUnwrap(promptResultRepo.saveCalls.first).includeMeetingNotesSnapshot)
+    }
+
+    func testGeneratePromptResultWithoutOptInOrTokenDoesNotSnapshotNotes() async throws {
+        let transcriptionID = UUID()
+        try transcriptionRepo.save(
+            Transcription(
+                id: transcriptionID,
+                fileName: "meeting.m4a",
+                sourceType: .meeting,
+                userNotes: "Private context"
+            )
+        )
+        let prompt = Prompt(name: "Summary", content: "Summarize.")
+        promptRepo.prompts = [prompt]
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo,
+            transcriptionRepo: transcriptionRepo
+        )
+        viewModel.selectedPrompt = prompt
+        llm.streamTokens = ["ok"]
+
+        viewModel.generatePromptResult(transcript: "transcript", transcriptionId: transcriptionID)
+        try await waitUntil { self.promptResultRepo.saveCalls.count == 1 }
+
+        XCTAssertEqual(llm.lastSummarySystemPrompt, "Summarize.")
+        XCTAssertNil(promptResultRepo.saveCalls.first?.userNotesSnapshot)
+    }
+
+    func testRegenerateUsesCheckboxSnapshotWithCurrentNotes() async throws {
+        let transcriptionID = UUID()
+        try transcriptionRepo.save(
+            Transcription(
+                id: transcriptionID,
+                fileName: "meeting.m4a",
+                sourceType: .meeting,
+                userNotes: "Current notes"
+            )
+        )
+        let existing = PromptResult(
+            transcriptionId: transcriptionID,
+            promptName: "Summary",
+            promptContent: "Summarize.",
+            content: "Old",
+            userNotesSnapshot: "Old notes",
+            includeMeetingNotesSnapshot: true
+        )
+        promptResultRepo.promptResults = [existing]
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo,
+            transcriptionRepo: transcriptionRepo
+        )
+        viewModel.loadPromptResults(transcriptionId: transcriptionID)
+        llm.streamTokens = ["New"]
+
+        _ = viewModel.regeneratePromptResult(existing, transcript: "transcript")
+        try await waitUntil { self.promptResultRepo.replaceCalls.count == 1 }
+
+        let replacement = try XCTUnwrap(promptResultRepo.replaceCalls.first?.promptResult)
+        XCTAssertEqual(replacement.userNotesSnapshot, "Current notes")
+        XCTAssertTrue(replacement.includeMeetingNotesSnapshot)
+    }
+
+    func testRetryKeepsExactCappedNotesSnapshotWithoutRecappingOrRefetching() async throws {
+        let transcriptionID = UUID()
+        let longNotes = String(
+            repeating: "word ",
+            count: PromptResultsViewModel.userNotesPromptWordCap + 1
+        )
+        try transcriptionRepo.save(
+            Transcription(
+                id: transcriptionID,
+                fileName: "meeting.m4a",
+                sourceType: .meeting,
+                userNotes: longNotes
+            )
+        )
+        let existing = PromptResult(
+            transcriptionId: transcriptionID,
+            promptName: "Summary",
+            promptContent: "Summarize.",
+            content: "Old",
+            includeMeetingNotesSnapshot: true
+        )
+        promptResultRepo.promptResults = [existing]
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo,
+            transcriptionRepo: transcriptionRepo
+        )
+        viewModel.loadPromptResults(transcriptionId: transcriptionID)
+        llm.streamTokenBatches = [[], ["Recovered"]]
+
+        let failedID = try XCTUnwrap(viewModel.regeneratePromptResult(existing, transcript: "transcript"))
+        try await waitUntil {
+            if case .failed = self.viewModel.pendingGeneration(id: failedID)?.state { return true }
+            return false
+        }
+        let exactSnapshot = try XCTUnwrap(viewModel.pendingGeneration(id: failedID)?.userNotes)
+
+        try transcriptionRepo.save(
+            Transcription(
+                id: transcriptionID,
+                fileName: "meeting.m4a",
+                sourceType: .meeting,
+                userNotes: "Edited after failure"
+            )
+        )
+        _ = try XCTUnwrap(viewModel.retryGeneration(id: failedID))
+        try await waitUntil { self.promptResultRepo.replaceCalls.count == 1 }
+
+        let replacement = try XCTUnwrap(promptResultRepo.replaceCalls.first?.promptResult)
+        XCTAssertEqual(replacement.userNotesSnapshot, exactSnapshot)
+        XCTAssertEqual(
+            replacement.userNotesSnapshot,
+            PromptSystemPromptAssembler.truncateNotesForPrompt(longNotes)
+        )
+        XCTAssertFalse(replacement.userNotesSnapshot?.contains("Edited after failure") == true)
+    }
+
+    func testGeneratePromptResultRendersEmptyWhenUserNotesAreNil() async throws {
+        let transcriptionID = UUID()
+        // No userNotes set — non-meeting transcript or untouched notepad.
+        try transcriptionRepo.save(
+            Transcription(id: transcriptionID, fileName: "podcast.m4a")
+        )
+
+        let prompt = Prompt(
+            name: "Memo",
+            content: "Notes: [{{userNotes}}] end",
+            category: .result,
+            isBuiltIn: false,
+            sortOrder: 0
+        )
+        promptRepo.prompts = [prompt]
+
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo,
+            transcriptionRepo: transcriptionRepo
+        )
+        viewModel.selectedPrompt = prompt
+        llm.streamTokens = ["ok"]
+
+        viewModel.generatePromptResult(transcript: "transcript", transcriptionId: transcriptionID)
+        try await Task.sleep(for: .milliseconds(200))
+
+        XCTAssertEqual(llm.lastSummarySystemPrompt, "Notes: [] end")
+        XCTAssertNil(promptResultRepo.saveCalls.first?.userNotesSnapshot)
+    }
+
+    func testGeneratePromptResultLeavesNonNotesPromptsUnchangedWhenUserNotesEmpty() async throws {
+        let transcriptionID = UUID()
+        try transcriptionRepo.save(
+            Transcription(id: transcriptionID, fileName: "f.m4a")
+        )
+
+        // A "classic" prompt with no `{{userNotes}}` reference — no regression
+        // on default output for users who took no notes.
+        let classic = Prompt(
+            name: "Classic",
+            content: "Summarize the transcript in 3 bullet points.",
+            category: .result,
+            isBuiltIn: false,
+            sortOrder: 0
+        )
+        promptRepo.prompts = [classic]
+
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo,
+            transcriptionRepo: transcriptionRepo
+        )
+        viewModel.selectedPrompt = classic
+        llm.streamTokens = ["ok"]
+
+        viewModel.generatePromptResult(transcript: "transcript", transcriptionId: transcriptionID)
+        try await Task.sleep(for: .milliseconds(200))
+
+        XCTAssertEqual(
+            llm.lastSummarySystemPrompt,
+            "Summarize the transcript in 3 bullet points."
+        )
+    }
+
+    func testTruncateNotesForPromptStaysUnderSoftCap() {
+        let shortNotes = "one two three four five"
+        XCTAssertEqual(
+            PromptResultsViewModel.truncateNotesForPrompt(shortNotes),
+            shortNotes,
+            "notes under the cap pass through unmodified"
+        )
+
+        let longNotes = String(repeating: "word ", count: PromptResultsViewModel.userNotesPromptWordCap + 100)
+            .trimmingCharacters(in: .whitespaces)
+        let truncated = PromptResultsViewModel.truncateNotesForPrompt(longNotes)
+        let truncatedWordCount =
+            truncated
+            .split(whereSeparator: \.isWhitespace)
+            .filter { !$0.contains("[") && !$0.contains("words") && !$0.contains("(") }
+            .count
+        XCTAssertLessThanOrEqual(
+            truncatedWordCount,
+            PromptResultsViewModel.userNotesPromptWordCap + 25,
+            "truncated notes must be near the soft cap (allowing for the suffix banner)"
+        )
+        XCTAssertTrue(
+            truncated.contains("Notes truncated to \(PromptResultsViewModel.userNotesPromptWordCap) words"),
+            "truncation must include the explanatory suffix"
+        )
+    }
+
+    /// Regression: Gemini review of PR #143 flagged that `truncateNotesForPrompt`
+    /// used `split + join(" ")`, flattening newlines/tabs/indentation into
+    /// single spaces. That destroys the structural cues (bullet lists, section
+    /// headings, slash-command markers) the user typed *to steer* the summary.
+    func testTruncateNotesForPromptPreservesWhitespaceInKeptPortion() {
+        let cap = PromptResultsViewModel.userNotesPromptWordCap
+        // Build a structured prefix the kept portion must preserve verbatim.
+        let structuredPrefix =
+            "## Roadmap\n\n**Action:** ship infra refactor\n\t- subtask: review staffing plan\n\n[6:02] confirmed"
+        let filler = String(repeating: " filler", count: cap + 50)
+        let input = structuredPrefix + filler
+
+        let truncated = PromptResultsViewModel.truncateNotesForPrompt(input)
+
+        XCTAssertTrue(
+            truncated.contains(
+                "## Roadmap\n\n**Action:** ship infra refactor\n\t- subtask: review staffing plan\n\n[6:02] confirmed"),
+            "Original whitespace (newlines, blank lines, tab indentation) must survive in the kept portion"
+        )
+        XCTAssertTrue(
+            truncated.contains("Notes truncated"),
+            "Truncation must still include the explanatory suffix"
+        )
+    }
+
+    /// Regression: Gemini review of PR #143 flagged that `assembledSystemPrompt`
+    /// didn't pass the transcript to `PromptTemplateRenderer`, so prompts
+    /// containing `{{transcript}}` would render with an empty string instead
+    /// of the actual transcript text. ADR-020 §4 lists `{{transcript}}` as a
+    /// supported variable; this test pins the substitution.
+    func testGeneratePromptResultSubstitutesTranscriptIntoSystemPrompt() async throws {
+        let transcriptionID = UUID()
+        try transcriptionRepo.save(
+            Transcription(
+                id: transcriptionID,
+                fileName: "meeting-playback.m4a",
+                sourceType: .meeting
+            )
+        )
+
+        let transcriptInlinePrompt = Prompt(
+            name: "Inline-Transcript",
+            content: "Read this:\nTRANSCRIPT:\n{{transcript}}\n---\nReply.",
+            category: .result,
+            isBuiltIn: false,
+            sortOrder: 0
+        )
+        promptRepo.prompts = [transcriptInlinePrompt]
+
+        viewModel.configure(
+            llmService: llm,
+            promptRepo: promptRepo,
+            promptResultRepo: promptResultRepo,
+            transcriptionRepo: transcriptionRepo
+        )
+        viewModel.selectedPrompt = transcriptInlinePrompt
+        llm.streamTokens = ["done"]
+
+        viewModel.generatePromptResult(
+            transcript: "Sarah pushed back on shipping early.",
+            transcriptionId: transcriptionID
+        )
+        try await Task.sleep(for: .milliseconds(200))
+
+        XCTAssertEqual(
+            llm.lastSummarySystemPrompt,
+            "Read this:\nTRANSCRIPT:\nSarah pushed back on shipping early.\n---\nReply.",
+            "{{transcript}} must be substituted with the transcript text passed to generatePromptResult"
+        )
+    }
+
+    /// Regression for the truncation-banner edge case caught in Codex
+    /// fresh-eye review of PR #143: `indexAfterNthWord` returned a non-nil
+    /// index whenever the n-th word was followed by trailing whitespace,
+    /// triggering a false `[Notes truncated...]` banner even though the
+    /// entire input fit under the cap.
+    func testTruncateNotesForPromptDoesNotBannerWhenInputFitsExactlyWithTrailingWhitespace() {
+        let cap = PromptResultsViewModel.userNotesPromptWordCap
+
+        // Exactly `cap` words, ending with trailing whitespace (newline).
+        let exactlyAtCap = String(repeating: "word ", count: cap) + "\n"
+        let resultExact = PromptResultsViewModel.truncateNotesForPrompt(exactlyAtCap)
+        XCTAssertFalse(
+            resultExact.contains("Notes truncated"),
+            "Input with exactly \(cap) words must NOT be banner-tagged even when followed by trailing whitespace."
+        )
+        XCTAssertEqual(resultExact, exactlyAtCap, "No truncation → input passes through verbatim.")
+
+        // Fewer than `cap` words, also ending with trailing whitespace.
+        let underCap = String(repeating: "word ", count: cap - 50) + "\n\n"
+        let resultUnder = PromptResultsViewModel.truncateNotesForPrompt(underCap)
+        XCTAssertFalse(resultUnder.contains("Notes truncated"))
+        XCTAssertEqual(resultUnder, underCap)
+    }
+}
+
+private struct PromptAutoRunFetchError: Error {}
+
+private final class PromptLabelPolicyRepositoryMock: PromptLabelPolicyRepositoryProtocol, @unchecked Sendable {
+    var policiesByPromptID: [UUID: [PromptLabelPolicy]] = [:]
+
+    func fetchPolicies(promptId: UUID) throws -> [PromptLabelPolicy] {
+        policiesByPromptID[promptId] ?? []
+    }
+
+    func fetchPolicies(promptIds: Set<UUID>) throws -> [PromptLabelPolicy] {
+        promptIds.flatMap { policiesByPromptID[$0] ?? [] }
+    }
+
+    func replaceTargetLabels(promptId: UUID, labelIds: Set<UUID>) throws {
+        let now = Date()
+        policiesByPromptID[promptId] =
+            labelIds.isEmpty
+            ? []
+            : [
+                PromptLabelPolicy(
+                    promptId: promptId,
+                    scopeKind: .all,
+                    isAvailable: false,
+                    createdAt: now,
+                    updatedAt: now
+                )
+            ]
+                + labelIds.map {
+                    PromptLabelPolicy(
+                        promptId: promptId,
+                        scopeKind: .label,
+                        labelId: $0,
+                        isAvailable: true,
+                        createdAt: now,
+                        updatedAt: now
+                    )
+                }
+    }
+}
+
+private final class TranscriptionLabelRepositoryMock: TranscriptionMeetingLabelRepositoryProtocol, @unchecked Sendable {
+    var labelIDsByTranscriptionID: [UUID: Set<UUID>] = [:]
+
+    func labels(for _: UUID) throws -> [MeetingLabel] { [] }
+    func labelIDs(for transcriptionId: UUID) throws -> Set<UUID> {
+        labelIDsByTranscriptionID[transcriptionId] ?? []
+    }
+    func add(labelId _: UUID, to _: UUID) throws {}
+    func remove(labelId _: UUID, from _: UUID) throws {}
+    func replaceLabels(for transcriptionId: UUID, with labelIds: Set<UUID>) throws {
+        labelIDsByTranscriptionID[transcriptionId] = labelIds
+    }
+}
+
+private actor RecordingCardGenerator: CardGenerating {
+    private(set) var transcriptionIDs: [UUID] = []
+
+    func generate(transcriptionId: UUID, force _: Bool) async throws -> CardGenerationOutcome {
+        transcriptionIDs.append(transcriptionId)
+        return CardGenerationOutcome(card: nil, usage: nil, wasSkipped: true)
+    }
+}
